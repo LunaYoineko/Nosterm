@@ -418,7 +418,7 @@ proc loadConfig(): bool =
         savedSecKeyHex = hex
         result = true
   if relayConfigs.len == 0:
-    relayConfigs.add(RelayConfig(url: "wss://relay.yoinekodo.jp", read: true, write: true))
+    relayConfigs.add(RelayConfig(url: "wss://yabu.me", read: true, write: true))
 
 # Apply a freshly typed nsec: decode, store, persist.
 proc applyNsec(nsec: string): bool =
