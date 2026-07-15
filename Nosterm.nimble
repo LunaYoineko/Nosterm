@@ -5,7 +5,7 @@ author        = "LunaYoineko"
 description   = "Nostr TUI client in Nim"
 license       = "MIT"
 srcDir        = "src"
-bin           = @["nimstr_tui"]
+bin           = @["Nosterm"]
 
 
 # Dependencies
