@@ -1,0 +1,737 @@
+import std/[asyncdispatch, json, strformat, os, strutils, times, tables, unicode, random]
+import std/terminal except fgGreen, fgYellow, fgCyan, fgWhite, fgMagenta, fgRed
+import ws, illwill
+import secp256k1
+import nimSHA2
+
+# =============================================================================
+# nimstr_tui - Nostr TUI Client in Nim
+# =============================================================================
+# このファイルは Nostr プロトコルに対応したターミナルベースのクライアント（TUI）を実装します。
+# 主な機能:
+# - リレー（wss://yabu.me）から Kind 0 (プロフィール) と Kind 1 (テキストノート) を購読
+# - タイムライン表示（日本語対応の自動折り返し付き）
+# - nsec (Bech32 秘密鍵) の入力・保存・読み込み
+# - secp256k1 (Schnorr署名) を使用した投稿送信
+# - illwill ライブラリによるクロスプラットフォーム TUI 描画
+# =============================================================================
+
+# --------------------------------------------------
+# 1. 型定義とグローバル状態
+# --------------------------------------------------
+
+type
+  # Nostr イベントを表す内部データ構造
+  # 実際の Nostr イベントには id, sig, tags 等もあるが、表示に必要な最小限のみ保持
+  NostrEvent = object
+    id: string        # イベントID（重複判定用）
+    pubkey: string    # 公開鍵（hex, 64文字）
+    content: string   # 投稿内容
+    createdAt: int64  # 作成時刻（Unixタイムスタンプ、ソート用）
+
+  # アプリケーションの動作モード
+  # - ModeNormal: タイムライン閲覧・スクロール・キー操作受付
+  # - ModeInput:  投稿内容入力モード（カーソル表示）
+  # - ModeKeyInput: nsec 入力モード（初回起動時や S キー押下時）
+  AppMode = enum
+    ModeNormal,   # 閲覧・スクロールモード
+    ModeInput,    # 投稿入力モード
+    ModeKeyInput  # nsec入力モード
+
+# グローバル状態変数（シングルスレッドの async ループで動作するためグローバルで管理）
+var timeline: seq[NostrEvent] = @[]               # 受信した投稿の配列（createdAt 昇順でソート済み＝古い順）
+var profileCache = initTable[string, string]()    # pubkey(lowercase) -> 表示名 のキャッシュ
+var needsRedraw = true                            # 再描画が必要かフラグ
+var scrollOffset = 0                              # スクロールオフセット（0 = 最下部＝最新を追従）
+
+var appMode = AppMode.ModeNormal                  # 現在のアプリモード
+var inputBuffer = ""                              # 投稿入力バッファ
+var keyInputBuffer = ""                           # nsec入力バッファ
+var savedSecKeyHex = ""                           # 保存済み秘密鍵（hex, 32バイト＝64文字）
+
+var globalWS: WebSocket                           # 現在接続中の WebSocket（グローバルで保持し送信時に使用）
+let configPath = getHomeDir() / ".nimstr_config"  # 設定ファイルパス（~/.nimstr_config）
+var pendingProfiles: seq[string] = @[]            # プロフィール取得待ちの pubkey リスト
+var japaneseOnly = false                          # 日本語のみフィルタモード
+
+# --------------------------------------------------
+# クリーンアップ処理（Ctrl+C や終了時の後始末）
+# --------------------------------------------------
+proc exitProc() {.noconv.} =
+  # illwill の終了処理（ターミナルを元の状態に戻す）
+  illwillDeinit()
+  # カーソルを再表示
+  showCursor()
+  # 正常終了
+  quit(0)
+
+# --------------------------------------------------
+# 表示幅計算ユーティリティ（ASCII=1, 全角/絵文字=2）
+# --------------------------------------------------
+proc displayWidth(text: string): int =
+  ## 文字列の表示幅を計算（ASCII=1, それ以外=2）
+  result = 0
+  for r in text.toRunes:
+    let s = $r
+    if s.len == 1 and s[0].ord < 128:
+      result += 1
+    else:
+      result += 2
+
+# --------------------------------------------------
+# 2. 日本語対応：文字幅を考慮した自動折り返し（AutoWrap）
+# --------------------------------------------------
+# 通常の文字列分割では日本語等の全角文字が1文字として数えられずレイアウトが崩れるため、
+# Unicode のルーン（コードポイント）単位で処理し、簡易的に「ASCII=幅1, それ以外=幅2」として計算する
+# さらに、折り返し時に継続行のインデント幅（prefix幅）を考慮し、1行目と継続行でコンテンツ幅を揃える
+proc wrapText(text: string, maxWidth: int, indentWidth: int = 0): seq[string] =
+  ## TUIの横幅（maxWidth）に合わせて、文字列を安全に複数行に分割する
+  ## text: 折り返し対象の文字列
+  ## maxWidth: 1行あたりの最大幅（文字幅カウント、全角=2半角=1）。インデント含む総幅
+  ## indentWidth: 2行目以降のインデント幅（prefix分のスペース）。デフォルト0
+  ## 戻り値: 折り返された行のシーケンス（各行は maxWidth 以内、2行目以降は indentWidth 分インデント済み）
+  result = @[]
+  if text == "": return @[""]
+  
+  var currentLine = ""
+  var currentWidth = 0
+  var isFirstLine = true
+  
+  # 文字列をルーン（Unicodeコードポイント）の列としてイテレート
+  for r in text.toRunes:
+    let s = $r
+    # 文字幅判定：ASCII（1バイト）は幅1、それ以外（日本語・絵文字等）は幅2
+    # 注意: これは簡易判定。正確には wcwidth() や unicode ライブラリの EastAsianWidth を使うべき
+    let w = if s.len == 1 and s[0].ord < 128: 1 else: 2
+    
+    # 現在行の最大許容幅
+    # 初行: maxWidth 全体が利用可能
+    # 継続行: インデント分を差し引いた幅が利用可能
+    let lineMaxWidth = if isFirstLine: maxWidth else: maxWidth - indentWidth
+    
+    # 現在行に追加すると幅を超える場合 → 折り返し
+    if currentWidth + w > lineMaxWidth:
+      # 現在行を確定
+      result.add(currentLine)
+      # 新しい行を開始（継続行なのでインデント分のスペースを先頭に入れる）
+      currentLine = " ".repeat(indentWidth) & s
+      currentWidth = indentWidth + w
+      isFirstLine = false
+    else:
+      # 現在行に追加
+      currentLine.add(s)
+      currentWidth += w
+      
+  # 最後の行を追加
+  if currentLine != "":
+    result.add(currentLine)
+
+# --------------------------------------------------
+# 3. Bech32 (nsec) の簡易デコード処理
+# --------------------------------------------------
+# Nostr では秘密鍵を nsec1... という Bech32 形式で表現する
+# 標準ライブラリに Bech32 デコーダがないため、必要最小限の実装を行う
+# 参考: BIP-0173, NIP-01
+const Bech32Charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+proc decodeBech32(bechString: string): string =
+  ## nsec1... で始まる Bech32 文字列を 32バイトの hex 文字列（64文字）にデコード
+  ## 戻り値: 成功時は hex 文字列、失敗時は空文字列
+  if not bechString.startsWith("nsec1"): return ""
+  # "nsec1" (5文字) を除いたデータ部分を取得
+  let dataPart = bechString[5..^1]
+  
+  # Step 1: Bech32 文字セットのインデックス (5bit値) に変換
+  var bytes5: seq[byte] = @[]
+  for c in dataPart:
+    let idx = Bech32Charset.find(c)
+    if idx == -1: return ""  # 不正文字
+    bytes5.add(idx.byte)
+    
+  # チェックサム（最後の 6 文字 = 30bit）を除去
+  if bytes5.len < 6: return ""
+  bytes5.setLen(bytes5.len - 6)
+
+  # Step 2: 5bit 列を 8bit 列（バイト列）に変換（ビットパッキング）
+  var bytes8: seq[byte] = @[]
+  var accumulator = 0.uint32
+  var bits = 0
+  for b in bytes5:
+    accumulator = (accumulator shl 5) or b.uint32
+    bits += 5
+    # 8bit 以上溜まったら上位から取り出す
+    while bits >= 8:
+      bits -= 8
+      bytes8.add(((accumulator shr bits) and 0xFF.uint32).byte)
+
+  # 正しくデコードできたら 32 バイトになるはず
+  if bytes8.len != 32: return ""
+
+  # Step 3: バイト列を hex 文字列に変換
+  result = ""
+  for b in bytes8:
+    result.add(b.toHex(2).toLowerAscii())
+
+# --------------------------------------------------
+# 4. 設定ファイルの読み書き（秘密鍵の永続化）
+# --------------------------------------------------
+proc loadSecretKey(): bool =
+  ## ~/.nimstr_config から nsec を読み込み、デコードして savedSecKeyHex に格納
+  ## 戻り値: 成功時 true
+  if fileExists(configPath):
+    try:
+      let nsec = readFile(configPath).strip()
+      let hex = decodeBech32(nsec)
+      if hex != "":
+        savedSecKeyHex = hex
+        return true
+    except CatchableError:
+      discard  # ファイル読み込みエラーやデコード失敗は「キーなし」として扱う
+  return false
+
+proc saveSecretKey(nsec: string): bool =
+  ## 入力された nsec を検証し、問題なければ ~/.nimstr_config に保存（chmod 600）
+  ## 戻り値: 成功時 true
+  let hex = decodeBech32(nsec)
+  if hex == "": return false  # 不正な nsec
+  try:
+    writeFile(configPath, nsec)
+    # 権限を 600 (所有者のみ読み書き) に制限 - 秘密鍵なので重要
+    discard execShellCmd("chmod 600 " & quoteShell(configPath))
+    savedSecKeyHex = hex
+    return true
+  except CatchableError:
+    return false
+
+# --------------------------------------------------
+# 5. Nostrへの投稿送信 (secp256k1.Schnorr署名)
+# --------------------------------------------------
+# Nostr イベントの署名プロセス:
+# 1. イベントデータを正規化シリアライズ（[0, pubkey, created_at, kind, tags, content] の JSON 配列）
+# 2. その文字列を SHA256 でハッシュ（32バイト）
+# 3. 秘密鍵で Schnorr 署名（secp256k1 ライブラリ使用）
+# 4. 署名済みイベントを "EVENT" メッセージとしてリレーに送信
+proc sendNostrPost(content: string) {.async.} =
+  ## 投稿内容を署名してリレーに送信
+  if globalWS == nil: return
+  if savedSecKeyHex == "": return
+
+  # 1. 秘密鍵（Secret Key）をHexから読み込む
+  let seckeyRes = SkSecretKey.fromHex(savedSecKeyHex)
+  if not seckeyRes.isOk: return
+  let seckey = seckeyRes.value
+  
+  # 2. 秘密鍵から通常の公開鍵（PublicKey）を生成
+  let pubkey = seckey.toPublicKey()
+  
+  # 3. 通常の公開鍵からNostr用のXOnly公開鍵（32バイト）に変換
+  # Nostr (NIP-01) では schnorr 署名用に x-only pubkey を使用
+  let xonly = pubkey.toXOnly()
+  let pubkeyHex = $xonly
+
+  let createdAt = getTime().toUnix()
+  let tags = newJArray()
+  
+  # Nostr イベントの正規化シリアライズ形式（NIP-01 準拠）
+  # [0, pubkey, created_at, kind, tags, content]
+  let serializeArray = %*[
+    0,
+    pubkeyHex,
+    createdAt,
+    1,      # kind = 1 (Text Note)
+    tags,
+    content
+  ]
+  
+  # nimSHA2 で SHA256 ハッシュを計算（secp256k1 には sha256 が公開されていないため外部ライブラリ使用）
+  let hashData = computeSHA256($serializeArray)
+  let hashStr = hashData.hex
+  var eventId = ""
+  for i in 0 ..< 32:
+    eventId.add(hashStr[i*2..i*2+1])
+
+  # メッセージオブジェクトをハッシュ（バイト配列）から直接作成
+  var hashBytes: array[32, byte]
+  for i in 0 ..< 32:
+    hashBytes[i] = parseHexInt(hashStr[i*2..i*2+1]).byte
+  let msgRes = SkMessage.fromBytes(hashBytes)
+  if not msgRes.isOk: return
+  let msg = msgRes.value
+
+  # 4. 署名 (Schnorr Signature) を生成 - RNG版
+  # 署名にはランダムネスが必要（RFC 6979 準拠のデタミニスティック方式もあるがここでは RNG 使用）
+  let rng: secp256k1.Rng = proc(data: var openArray[byte]): bool =
+    for i in 0..<data.len:
+      data[i] = byte(rand(255))
+    true
+  let sigRes = seckey.signSchnorr(msg, rng)
+  if not sigRes.isOk: return
+  let sig = sigRes.value
+  let sigHex = $sig
+
+  # 完成したイベントを "EVENT" メッセージとして送信
+  let eventMsg = %*[
+    "EVENT",
+    {
+      "id": eventId,
+      "pubkey": pubkeyHex,
+      "created_at": createdAt,
+      "kind": 1,
+      "tags": tags,
+      "content": content,
+      "sig": sigHex
+    }
+  ]
+
+  try:
+    await globalWS.send($eventMsg)
+  except CatchableError:
+    discard  # 送信失敗は握りつぶす（UIには反映されないがログ等には出せる）
+
+# --------------------------------------------------
+# 6. バックグラウンド処理（Nostr監視：Kind 0 & Kind 1）
+# --------------------------------------------------
+# 別の async タスクとして常駐し、リレーからのメッセージを受信し続ける
+# - Kind 0 (Metadata): プロフィール情報 → display_name/name を抽出してキャッシュ
+# - Kind 1 (Text Note): 投稿内容 → timeline に時系列挿入
+proc requestProfiles(pubkeys: seq[string]) {.async.} =
+  ## 指定された pubkey 群のプロフィール（Kind 0）を個別に要求
+  ## 既存の購読とは別の subscription ID を使用
+  if pubkeys.len == 0: return
+  if globalWS == nil: return
+  
+  let subId = "profile-fetch-" & $getTime().toUnix()
+  var authorsJson = newJArray()
+  for pk in pubkeys:
+    authorsJson.add(%* pk)  # 文字列を JsonNode に変換して追加
+  
+  # authors フィルタで特定の pubkey の Kind 0 のみ取得
+  let reqMessage = %*[
+    "REQ",
+    subId,
+    {"kinds": [0], "authors": authorsJson, "limit": pubkeys.len}
+  ]
+  
+  try:
+    await globalWS.send($reqMessage)
+  except CatchableError:
+    discard
+
+# 同期コンテキストから呼べるラッパー
+proc fetchProfiles(pubkeys: seq[string]) =
+  ## 非同期の requestProfiles を fire-and-forget で呼び出し
+  if pubkeys.len == 0: return
+  asyncCheck requestProfiles(pubkeys)
+
+proc recvNostrEvents() {.async.} =
+  let relayUrl = "wss://yabu.me"
+  let subscriptionId = "my-tui-app"
+  
+  # REQ メッセージ: kinds [0, 1] でプロフィールとテキストノートの両方を購読
+  # limit: 60 で初回取得件数を制限（以降はリアルタイムで流れてくる）
+  let reqMessage = %*[
+    "REQ", 
+    subscriptionId, 
+    {"kinds": [0, 1], "limit": 60}
+  ]
+
+  while true:
+    try:
+      # WebSocket 接続確立
+      globalWS = await newWebSocket(relayUrl)
+      # 購読リクエスト送信
+      await globalWS.send($reqMessage)
+    except CatchableError:
+      # 接続失敗時は 5秒待機してリトライ
+      await sleepAsync(5000)
+      continue
+
+    # メッセージ受信ループ
+    while true:
+      try:
+        let packet = await globalWS.receiveStrPacket()
+        if packet == "": break  # 接続クローズ
+
+        let parsed = parseJson(packet)
+        # Nostr プロトコル: ["EVENT", sub_id, event_obj, ...]
+        if parsed.kind == JArray and parsed.len >= 3:
+          let msgType = parsed[0].getStr()
+          
+          if msgType == "EVENT":
+            let event = parsed[2]
+            let kind = event["kind"].getInt()
+            let pubkey = event["pubkey"].getStr()
+            
+            if kind == 0:
+              # ------------------------------------------------------------
+              # Kind 0 (Metadata): プロフィール情報の解析とキャッシュ
+              # ------------------------------------------------------------
+              # content フィールドに JSON 文字列が入っている
+              # {"display_name": "...", "name": "...", "about": "...", ...}
+              try:
+                let contentJson = parseJson(event["content"].getStr())
+                var name = ""
+                # display_name を優先、なければ name を使用
+                if contentJson.hasKey("display_name") and contentJson["display_name"].getStr() != "":
+                  name = contentJson["display_name"].getStr()
+                elif contentJson.hasKey("name") and contentJson["name"].getStr() != "":
+                  name = contentJson["name"].getStr()
+                
+                if name != "":
+                  # pubkey を小文字化してキーとして使用（大文字小文字の揺れ吸収）
+                  profileCache[pubkey.toLowerAscii()] = name
+                  needsRedraw = true  # 表示名が解決されたら再描画
+              except CatchableError:
+                discard  # JSONパース失敗等は無視
+                
+            elif kind == 1:
+              # ------------------------------------------------------------
+              # Kind 1 (Text Note): タイムラインへの挿入（時系列ソート済み位置に）
+              # ------------------------------------------------------------
+              let content = event["content"].getStr()
+              let createdAt = event["created_at"].getInt()
+              let eventId = event["id"].getStr()
+              let newEvent = NostrEvent(id: eventId, pubkey: pubkey, content: content, createdAt: createdAt)
+              
+              # 重複判定: イベントIDで既に存在するかチェック
+              var isDuplicate = false
+              for existing in timeline:
+                if existing.id == eventId:
+                  isDuplicate = true
+                  break
+              if isDuplicate:
+                continue
+              
+              # 二分探索で挿入位置を見つけて挿入（古い順＝昇順）
+              # timeline は常に createdAt 昇順で維持される
+              # - index 0: 最古の投稿
+              # - index high: 最新の投稿
+              # これにより「画面下部が最新」という自然なレイアウトが可能
+              var left = 0
+              var right = timeline.len
+              while left < right:
+                let mid = (left + right) div 2
+                if timeline[mid].createdAt <= createdAt:
+                  left = mid + 1
+                else:
+                  right = mid
+              timeline.insert(newEvent, left)
+              
+              # 最大 150 件に制限（古いものから削除＝index 0 を削除）
+              if timeline.len > 150:
+                timeline.delete(0)
+              
+              # スクロール中（scrollOffset > 0）ならオフセットを調整して位置を維持
+              if scrollOffset > 0:
+                scrollOffset = min(scrollOffset + 1, timeline.high)
+              
+              # この投稿のプロフィールが未取得なら個別に取得要求（重複防止）
+              let pubkeyLower = pubkey.toLowerAscii()
+              if not profileCache.hasKey(pubkeyLower) and pubkeyLower notin pendingProfiles:
+                pendingProfiles.add(pubkeyLower)
+                fetchProfiles(@[pubkey])
+              
+              needsRedraw = true
+
+      except CatchableError:
+        # 受信エラー時は外側のループで再接続
+        break
+
+    globalWS.close()
+    # 再接続前の待機
+    await sleepAsync(2000)
+
+# --------------------------------------------------
+# 7. メイン処理（TUIループ）
+# --------------------------------------------------
+proc main() {.async.} =
+  # illwill 初期化（ターミナルを raw mode に、代替スクリーンバッファ有効化等）
+  illwillInit()
+  # Ctrl+C ハンドラ登録
+  setControlCHook(exitProc)
+  # カーソル非表示（デフォルト）
+  hideCursor()
+
+  # 起動時にローカルからキーを読み込む
+  let keyLoaded = loadSecretKey()
+  if not keyLoaded:
+    # キーがない場合は読み取り専用モードで開始（nsec入力画面は出さない）
+    # ユーザーが 'S' キーを押したときに入力モードになる
+    appMode = AppMode.ModeNormal
+
+  # 端末サイズ取得（取得失敗時のフォールバック付き）
+  var (cols, rows) = terminalSize()
+  if cols <= 0: cols = 80
+  if rows <= 0: rows = 24
+  var tb = newTerminalBuffer(cols, rows)
+
+  # バックグラウンドで Nostr 受信開始（非同期タスクとして起動、完了を待たない）
+  discard recvNostrEvents()
+
+  # ============================================================
+  # メインイベントループ
+  # ============================================================
+  while true:
+    # ノンブロッキングでキー入力取得（timeout=0 で即座に返る）
+    var key = getKeyWithTimeout(0)
+    
+    # --- モード分岐（キー入力処理） ---
+    if appMode == AppMode.ModeKeyInput:
+      # --------------------------------------------------------
+      # nsec 入力モード: 文字入力・Backspace・Enter・ESC のみ受付
+      # 他のショートカットキー (i, j, k, l, q 等) は無効
+      # --------------------------------------------------------
+      case key
+      of Key.Escape:
+        # ESCでキャンセル → 読み取り専用モードに戻る（終了しない！）
+        appMode = AppMode.ModeNormal
+        keyInputBuffer = ""
+        hideCursor()
+        needsRedraw = true
+      of Key.Enter:
+        # Enter で保存試行
+        if saveSecretKey(keyInputBuffer.strip()):
+          appMode = AppMode.ModeNormal
+          keyInputBuffer = ""
+          hideCursor()
+          needsRedraw = true
+        else:
+          keyInputBuffer = "INVALID nsec! Try again."
+          needsRedraw = true
+      of Key.Backspace:
+        if keyInputBuffer.len > 0 and keyInputBuffer != "INVALID nsec! Try again.":
+          keyInputBuffer.setLen(keyInputBuffer.len - 1)
+          needsRedraw = true
+      of Key.None: discard  # 入力なし
+      else:
+        # 通常文字入力
+        if key != Key.None:
+          let keyChar = chr(int(key))
+          if keyChar != '\0':
+            if keyInputBuffer == "INVALID nsec! Try again.": keyInputBuffer = ""
+            keyInputBuffer.add(keyChar)
+            needsRedraw = true
+
+    elif appMode == AppMode.ModeNormal:
+      # --------------------------------------------------------
+      # 通常モード: タイムライン操作・モード切替
+      # --------------------------------------------------------
+      case key
+      of Key.Q, Key.Escape: exitProc()  # 終了
+      of Key.I:
+        # 投稿モードへ
+        appMode = AppMode.ModeInput
+        needsRedraw = true
+        showCursor()
+      of Key.S:
+        # nsec 設定・変更モードへ
+        appMode = AppMode.ModeKeyInput
+        keyInputBuffer = ""
+        needsRedraw = true
+        showCursor()
+      of Key.Up, Key.K:
+        # 上スクロール（過去へ遡る）
+        if timeline.len > 0:
+          scrollOffset = min(scrollOffset + 1, timeline.high)
+          needsRedraw = true
+      of Key.Down, Key.J:
+        # 下スクロール（最新へ戻る）
+        if scrollOffset > 0:
+          scrollOffset = max(scrollOffset - 1, 0)
+          needsRedraw = true
+      of Key.L:
+        # Live モード（最新追従）に戻る
+        scrollOffset = 0
+        needsRedraw = true
+      of Key.F:
+        # 日本語フィルタ切り替え
+        japaneseOnly = not japaneseOnly
+        needsRedraw = true
+      of Key.None:
+        # 入力なし時はリサイズチェックのみ
+        let (newCols, newRows) = terminalSize()
+        if newCols > 0 and newRows > 0 and (newCols != cols or newRows != rows):
+          cols = newCols; rows = newRows
+          tb = newTerminalBuffer(cols, rows)
+          needsRedraw = true
+      else: discard
+
+    elif appMode == AppMode.ModeInput:
+      # --------------------------------------------------------
+      # 投稿入力モード: 文字入力・Backspace・Enter・ESC
+      # --------------------------------------------------------
+      case key
+      of Key.Escape:
+        # キャンセル
+        appMode = AppMode.ModeNormal
+        inputBuffer = ""
+        hideCursor()
+        needsRedraw = true
+      of Key.Enter:
+        # 送信
+        if inputBuffer.strip() != "":
+          asyncCheck sendNostrPost(inputBuffer)
+          inputBuffer = ""
+        appMode = AppMode.ModeNormal
+        hideCursor()
+        needsRedraw = true
+      of Key.Backspace:
+        if inputBuffer.len > 0:
+          inputBuffer.setLen(inputBuffer.len - 1)
+          needsRedraw = true
+      of Key.None: discard
+      else:
+        if key != Key.None:
+          let keyChar = chr(int(key))
+          if keyChar != '\0':
+            inputBuffer.add(keyChar)
+            needsRedraw = true
+
+# --------------------------------------------------
+# 日本語フィルタ用ヘルパー
+# --------------------------------------------------
+proc containsJapanese(text: string): bool =
+  ## 文字列にひらがな・カタカナ・漢字が含まれるか判定
+  for r in text.toRunes:
+    let cp = r.ord
+    # ひらがな: U+3040-U+309F, カタカナ: U+30A0-U+30FF, 漢字: U+4E00-U+9FAF
+    # 全角記号等: U+FF00-U+FFEF
+    if (cp >= 0x3040 and cp <= 0x309F) or
+       (cp >= 0x30A0 and cp <= 0x30FF) or
+       (cp >= 0x4E00 and cp <= 0x9FAF) or
+       (cp >= 0xFF00 and cp <= 0xFFEF):
+      return true
+  return false
+
+# --------------------------------------------------
+# 8. 画面描画処理
+# --------------------------------------------------
+  if needsRedraw:
+    tb.clear()
+    # 外枠描画
+    tb.drawRect(0, 0, cols - 1, rows - 1)
+    tb.write(2, 0, "[ Nimstr - Nostr TUI ]", fgYellow)
+
+    if appMode == AppMode.ModeKeyInput:
+        # --------------------------------------------------------
+        # 秘密鍵入力画面
+        # --------------------------------------------------------
+        tb.write(4, 3, "Welcome to Nimstr!", fgYellow)
+        tb.write(4, 5, "Please enter your Nostr secret key (nsec1...):", fgWhite)
+        tb.drawHorizLine(4, cols - 5, 7)
+        
+        # 入力内容をマスク表示（先頭9文字のみ見せ、以降は * で隠す）
+        var maskedKey = ""
+        for idx, c in keyInputBuffer:
+          if idx < 9: maskedKey.add(c)
+          else: maskedKey.add('*')
+          
+        tb.write(4, 6, "> " & maskedKey, fgCyan)
+        tb.write(4, rows - 3, "Press [Enter] to Save & Start | [Esc] to Cancel", fgWhite)
+        
+      else:
+        # --------------------------------------------------------
+        # 通常のタイムライン画面
+        # --------------------------------------------------------
+        # ステータスバー（右上）
+        let statusText = if scrollOffset == 0: "[ LIVE - Tracking Latest ]" else: fmt"[ Scroll: {scrollOffset}/{timeline.len} (Press 'L' to Live) ]"
+        let statusColor = if scrollOffset == 0: fgGreen else: fgMagenta
+        tb.write(cols - 2 - statusText.len, 0, statusText, statusColor)
+        
+        # 区切り線（タイムラインと入力エリアの間）
+        tb.drawHorizLine(0, cols - 1, rows - 4)
+        
+        # 操作ヒント（左下）
+        if appMode == AppMode.ModeNormal:
+          tb.write(2, rows - 3, "i: Post Message | S: Set nsec | K/Up: Scroll Up | J/Down: Scroll Down | L: Live | Q: Quit", fgWhite)
+        else:
+          tb.write(2, rows - 3, "TYPE YOUR MESSAGE AND PRESS ENTER TO POST (ESC TO CANCEL)", fgYellow)
+
+        # 入力プロンプト（最下部）
+        let prompt = "> "
+        tb.write(2, rows - 2, prompt, fgCyan)
+        tb.write(2 + prompt.len, rows - 2, inputBuffer, fgWhite)
+
+        # --------------------------------------------------------
+        # タイムラインのレンダリング（AutoWrap & 表示名対応、下が最新）
+        # --------------------------------------------------------
+        # 描画領域: 行 1 (timelineTopY) から rows-5 (timelineBottomY) まで
+        # 画面下部 (timelineBottomY) から上向きに描画 → 最新が下に来る
+        # 固定UI要素と重ならないよう厳密に境界を守る
+        let timelineBottomY = rows - 5   # 区切り線(rows-4)の直上
+        let timelineTopY = 1             # ステータスバー(行0)の直下
+        var currentY = timelineBottomY
+        
+        if timeline.len > 0:
+          # 表示開始インデックス計算
+          # scrollOffset = 0 なら timeline.high (最新)
+          # scrollOffset > 0 なら timeline.high - scrollOffset (過去へ遡る)
+          let startIndex = timeline.high - scrollOffset
+          
+          # startIndex から 0 へ向かって逆順イテレート（新しい順→古い順）
+          for i in countdown(startIndex, 0):
+            # 画面上端に達したら停止
+            if currentY < timelineTopY: break
+            if i >= timeline.len: break
+            
+            let ev = timeline[i]
+            
+            # 日本語フィルタ: 日本語を含まない投稿はスキップ
+            if not containsJapanese(ev.content):
+              continue
+            
+            # 表示名の決定（キャッシュにあればそれを使用、なければ公開鍵の先頭8文字）
+            # pubkey は hex なので大文字小文字の揺れを吸収するため toLowerAscii() で正規化
+            let displayName = if profileCache.hasKey(ev.pubkey.toLowerAscii()):
+                                profileCache[ev.pubkey.toLowerAscii()]
+                              else:
+                                ev.pubkey[0..7]
+            
+            let prefix = fmt"[{displayName}]: "
+            # prefixの表示幅を正しく計算（全角文字考慮）
+            let prefixWidth = displayWidth(prefix)
+            
+            # 自動折り返し処理
+            # 利用可能幅 = 画面幅 - 左マージン(2) - 右マージン(2) - prefix幅
+            # 継続行は prefix幅分のインデントが入るため、同じ幅で計算して wrapText に渡す
+            let maxContentWidth = cols - 4 - prefixWidth
+            # wrapText に indentWidth=prefixWidth を渡すことで、2行目以降のインデントを考慮した折り返しを行う
+            let wrappedLines = wrapText(ev.content, maxContentWidth, prefixWidth)
+            
+            # 複数行を上から下へ描画（lineIdx=0 が prefix 付きの最初の行）
+            # currentY は下から上へデクリメントしながら進む
+            for lineIdx in 0 .. wrappedLines.high:
+              # 上端境界チェック
+              if currentY < timelineTopY: break
+              # 下端境界チェック（念のため）
+              if currentY > timelineBottomY: break
+              
+              if lineIdx == 0:
+                # 最初の行: prefix (シアン) + 本文 (白)
+                tb.write(2, currentY, prefix, fgCyan)
+                tb.write(2 + prefixWidth, currentY, wrappedLines[lineIdx], fgWhite)
+              else:
+                # 2行目以降: prefix 分のインデント + 本文 (白)
+                # wrappedLines は既に indentWidth 分インデント済み
+                tb.write(2, currentY, wrappedLines[lineIdx], fgWhite)
+              
+              currentY -= 1  # 上の行へ
+
+      # ターミナルバッファを実際の画面に反映
+      tb.display()
+      
+      # カーソル位置調整（入力モード時のみ）
+      if appMode == AppMode.ModeInput:
+        # プロンプト "> " (2文字) + 入力バッファの長さ
+        setCursorPos(2 + 2 + inputBuffer.len, rows - 2)
+      elif appMode == AppMode.ModeKeyInput:
+        # nsec入力行 (y=6) の "> " (2文字) + 入力長
+        setCursorPos(4 + 2 + keyInputBuffer.len, 6)
+        
+      needsRedraw = false
+
+    # CPU使用率抑制のため少しスリープ（50fps相当）
+    await sleepAsync(20)
+
+# エントリーポイント: async main を実行
+waitFor main()
