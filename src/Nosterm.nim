@@ -303,10 +303,17 @@ type
     ModeMention,  # Mention picker mode
     ModeRelay,    # Relay manager
     ModeRelayAdd, # Adding a relay (URL input)
-    ModeRelayPick # Picking relays from the account's kind 10002 list
+    ModeRelayPick, # Picking relays from the account's kind 10002 list
+    ModeReaction,  # Reaction emoji input mode
+    ModeSettings    # Standalone settings window (relays, key, filters)
 
 var timeline: seq[NostrEvent] = @[]
 var profileCache = initTable[string, string]()  # pubkey(lowercase) -> display name
+# Reactions (NIP-25): event id -> list of (emoji, reactor pubkey).
+var reactions = initTable[string, seq[tuple[emoji: string, pubkey: string]]]()
+var selectedEventId = ""   # currently focused post (for reacting); "" = newest
+var reactionBuffer = ""    # emoji being typed in ModeReaction
+var settingsActive = false  # true when relay/key sub-modes were opened from Settings
 var needsRedraw = true
 var scrollOffset = 0
 
@@ -446,6 +453,10 @@ proc sendToRelays(msg: string) {.async.}
 proc applyRelayConfig()
 proc collectAccountRelay(content: string)
 proc refreshMentionFilter()
+proc refetchTimeline()
+proc sendReaction(targetId, targetAuthor, emoji: string) {.async.}
+proc moveSelection(delta: int)
+proc currentSelectedEvent(): NostrEvent
 
 proc sendNostrPost(content: string, mentions: seq[string] = @[]) {.async.} =
   if savedSecKeyHex == "": return
@@ -614,10 +625,9 @@ proc handleInputRune(ru: Rune) =
   # Ignore arrow-key sentinels (only meaningful in the mention picker).
   if ru == RuneUp or ru == RuneDown or ru == RuneLeft or ru == RuneRight:
     return
-  # Ctrl+L forces a full repaint.
+  # Ctrl+L forces a full timeline rebuild + repaint.
   if ru.ord == 12:
-    forceRedraw = true
-    needsRedraw = true
+    refetchTimeline()
     return
   if ru == Rune(int('\e')):
     appMode = AppMode.ModeNormal
@@ -729,6 +739,40 @@ proc handleMentionRune(ru: Rune) =
       refreshMentionFilter()
       needsRedraw = true
 
+# Type an emoji (or any text) to react to the focused post, then Enter to send.
+proc handleReactionRune(ru: Rune) =
+  if ru == RuneUp or ru == RuneDown or ru == RuneLeft or ru == RuneRight:
+    return
+  if ru.ord == 12:   # Ctrl+L
+    refetchTimeline()
+    return
+  if ru == Rune(int('\e')):
+    appMode = AppMode.ModeNormal
+    reactionBuffer = ""
+    hideTermCursor()
+    needsRedraw = true
+    return
+  if ru == Rune(int('\n')) or ru == Rune(int('\r')):
+    let emoji = reactionBuffer.strip()
+    let t = currentSelectedEvent()
+    if emoji != "" and t.id != "":
+      asyncCheck sendReaction(t.id, t.pubkey, emoji)
+    appMode = AppMode.ModeNormal
+    reactionBuffer = ""
+    hideTermCursor()
+    needsRedraw = true
+    return
+  if ru == Rune(0x7f) or ru == Rune(0x08):   # DEL / Backspace
+    if reactionBuffer.len > 0:
+      let runes = reactionBuffer.toRunes
+      reactionBuffer = $runes[0 .. ^2]
+      needsRedraw = true
+    return
+  let ch = $ru
+  if displayWidth(reactionBuffer) + displayWidth(ch) <= cols - 2 - 4:
+    reactionBuffer.add(ch)
+    needsRedraw = true
+
 # --------------------------------------------------
 # 4. Profile fetch requests (sent to read relays)
 # --------------------------------------------------
@@ -807,6 +851,28 @@ proc processPacket(packet: string) =
           # Account relay list: collect candidates for the manual picker.
           if fetchingAccountRelays:
             collectAccountRelay(event["content"].getStr())
+
+        elif kind == 7:
+          # Reaction (NIP-25): aggregate by target event + emoji + reactor.
+          let content = event["content"].getStr()
+          var eId = ""
+          var pId = ""
+          if event.hasKey("tags") and event["tags"].kind == JArray:
+            for t in event["tags"]:
+              if t.kind == JArray and t.len >= 2:
+                if t[0].getStr() == "e": eId = t[1].getStr()
+                elif t[0].getStr() == "p": pId = t[1].getStr()
+          if eId != "":
+            let pk = event["pubkey"].getStr().toLowerAscii()
+            var dup = false
+            if reactions.hasKey(eId):
+              for r in reactions[eId]:
+                if r.emoji == content and r.pubkey == pk: dup = true
+            else:
+              reactions[eId] = @[]
+            if not dup:
+              reactions[eId].add((emoji: content, pubkey: pk))
+              needsRedraw = true
   except CatchableError:
     discard
 
@@ -888,6 +954,98 @@ proc applyRelayConfig() =
     if rc.read or rc.write:
       asyncCheck relayRecv(rc.url, rc.read, rc.write, relayGen)
 
+# Clear the timeline and re-request kind 0/1 from every read relay. Used by the
+# "full rebuild" key (Ctrl+L) to recover from a corrupted layout / stale state.
+proc refetchTimeline() =
+  timeline = @[]
+  selectedEventId = ""
+  scrollOffset = 0
+  reactions = initTable[string, seq[tuple[emoji: string, pubkey: string]]]()
+  let conns = relayConns
+  let subId = "nosterm-refresh-" & $getTime().toUnix()
+  let req = %*["REQ", subId, {"kinds": [0, 1], "limit": 60}]
+  for rc in conns:
+    if rc.read:
+      let ws = rc.ws
+      asyncCheck (proc() {.async.} =
+        try: await ws.send($req) except CatchableError: discard)()
+  forceRedraw = true
+  needsRedraw = true
+
+# Move the focused post selection (delta > 0 = newer, < 0 = older).
+proc moveSelection(delta: int) =
+  if timeline.len == 0:
+    selectedEventId = ""
+    return
+  var idx = -1
+  if selectedEventId != "":
+    for i in 0 .. timeline.high:
+      if timeline[i].id == selectedEventId: idx = i; break
+  if idx == -1: idx = timeline.high
+  idx = clamp(idx + delta, 0, timeline.high)
+  selectedEventId = timeline[idx].id
+  needsRedraw = true
+
+# Resolve the currently focused post: the explicitly selected one, or the
+# newest (timeline is sorted oldest-first, so index high = newest).
+proc currentSelectedEvent(): NostrEvent =
+  if timeline.len == 0:
+    return NostrEvent(id: "", pubkey: "", content: "", createdAt: 0, client: "")
+  if selectedEventId != "":
+    for ev in timeline:
+      if ev.id == selectedEventId: return ev
+  return timeline[timeline.high]
+
+# Send a reaction (kind 7) to a post, tagging the target event and author.
+proc sendReaction(targetId, targetAuthor, emoji: string) {.async.} =
+  if savedSecKeyHex == "" or targetId == "": return
+  let seckeyRes = SkSecretKey.fromHex(savedSecKeyHex)
+  if not seckeyRes.isOk: return
+  let seckey = seckeyRes.value
+  let pubkey = seckey.toPublicKey()
+  let pubkeyHex = $(pubkey.toXOnly())
+
+  let createdAt = getTime().toUnix()
+  let tags = newJArray()
+  tags.add(%* ["e", targetId])
+  tags.add(%* ["p", targetAuthor])
+  tags.add(%* ["client", "Nosterm"])
+
+  let serializeArray = %*[0, pubkeyHex, createdAt, 7, tags, emoji]
+  let hashData = computeSHA256($serializeArray)
+  let hashStr = hashData.hex.toLowerAscii()
+  var eventId = ""
+  for i in 0 ..< 32:
+    eventId.add(hashStr[i*2 .. i*2+1])
+  var hashBytes: array[32, byte]
+  for i in 0 ..< 32:
+    hashBytes[i] = parseHexInt(hashStr[i*2 .. i*2+1]).byte
+  let msgRes = SkMessage.fromBytes(hashBytes)
+  if not msgRes.isOk: return
+  let msg = msgRes.value
+  let rng: secp256k1.Rng = proc(data: var openArray[byte]): bool =
+    for i in 0 ..< data.len:
+      data[i] = byte(rand(255))
+    true
+  let sigRes = seckey.signSchnorr(msg, rng)
+  if not sigRes.isOk: return
+  let sigHex = ($sigRes.value).toLowerAscii()
+  let eventMsg = %*["EVENT", {
+    "id": eventId, "pubkey": pubkeyHex, "created_at": createdAt,
+    "kind": 7, "tags": tags, "content": emoji, "sig": sigHex
+  }]
+  asyncCheck sendToRelays($eventMsg)
+  # Show our own reaction immediately (deduped against the relay echo).
+  var dup = false
+  if reactions.hasKey(targetId):
+    for r in reactions[targetId]:
+      if r.emoji == emoji and r.pubkey == pubkeyHex.toLowerAscii(): dup = true
+  else:
+    reactions[targetId] = @[]
+  if not dup:
+    reactions[targetId].add((emoji: emoji, pubkey: pubkeyHex.toLowerAscii()))
+  needsRedraw = true
+
 # Insert an event into the timeline (dedup by id, keep sorted by createdAt,
 # adjust scroll, fetch missing profiles). Shared by the receiver and the poster.
 proc insertEvent(ev: NostrEvent) =
@@ -954,28 +1112,31 @@ proc main() {.async.} =
 
   while true:
     var key: Key = Key.None
-    if appMode == AppMode.ModeInput or appMode == AppMode.ModeMention:
+    if appMode == AppMode.ModeInput or appMode == AppMode.ModeMention or
+       appMode == AppMode.ModeReaction:
       # Read raw UTF-8 runes so Japanese / multi-byte input is captured intact.
       while true:
         let ru = nextRune()
         if ru == Rune(0): break
         if appMode == AppMode.ModeInput:
           handleInputRune(ru)
-        else:
+        elif appMode == AppMode.ModeMention:
           handleMentionRune(ru)
+        else:
+          handleReactionRune(ru)
     else:
       key = getKeyWithTimeout(0)
 
-    # Ctrl+L forces a full repaint (handy when the layout gets corrupted).
+    # Ctrl+L forces a full timeline rebuild + repaint.
     if key == Key.CtrlL:
-      forceRedraw = true
-      needsRedraw = true
+      refetchTimeline()
       continue
 
     if appMode == AppMode.ModeKeyInput:
       case key
       of Key.Escape:
-        appMode = AppMode.ModeNormal
+        if settingsActive: appMode = AppMode.ModeSettings
+        else: appMode = AppMode.ModeNormal
         keyInputBuffer = ""
         hideTermCursor()
         needsRedraw = true
@@ -987,7 +1148,8 @@ proc main() {.async.} =
             if skRes.isOk:
               myPubkeyHex = $skRes.value.toPublicKey().toXOnly()
           applyRelayConfig()
-          appMode = AppMode.ModeNormal
+          if settingsActive: appMode = AppMode.ModeSettings
+          else: appMode = AppMode.ModeNormal
           keyInputBuffer = ""
           hideTermCursor()
           needsRedraw = true
@@ -1015,10 +1177,9 @@ proc main() {.async.} =
         needsRedraw = true
         showTermCursor()
       of Key.S:
-        appMode = AppMode.ModeKeyInput
-        keyInputBuffer = ""
+        settingsActive = false
+        appMode = AppMode.ModeSettings
         needsRedraw = true
-        showTermCursor()
       of Key.F:
         japaneseOnly = not japaneseOnly
         needsRedraw = true
@@ -1033,6 +1194,17 @@ proc main() {.async.} =
       of Key.L:
         scrollOffset = 0
         needsRedraw = true
+      of Key.Left:
+        moveSelection(-1)
+      of Key.Right:
+        moveSelection(1)
+      of Key.E:
+        # Enter emoji-input mode to react to the focused post.
+        if currentSelectedEvent().id != "":
+          reactionBuffer = ""
+          appMode = AppMode.ModeReaction
+          needsRedraw = true
+          showTermCursor()
       of Key.R:
         if relayConfigs.len > 0: relaySel = 0
         appMode = AppMode.ModeRelay
@@ -1048,7 +1220,10 @@ proc main() {.async.} =
     elif appMode == AppMode.ModeRelay:
       case key
       of Key.Escape:
-        appMode = AppMode.ModeNormal
+        if settingsActive:
+          appMode = AppMode.ModeSettings
+        else:
+          appMode = AppMode.ModeNormal
         needsRedraw = true
       of Key.Up, Key.K:
         if relayConfigs.len > 0:
@@ -1087,6 +1262,7 @@ proc main() {.async.} =
       case key
       of Key.Escape:
         appMode = AppMode.ModeRelay
+        if settingsActive: appMode = AppMode.ModeSettings
         hideTermCursor()
         needsRedraw = true
       of Key.Enter:
@@ -1095,6 +1271,7 @@ proc main() {.async.} =
           relayConfigs.add(RelayConfig(url: url, read: true, write: true))
           saveConfig(); applyRelayConfig()
         appMode = AppMode.ModeRelay
+        if settingsActive: appMode = AppMode.ModeSettings
         hideTermCursor()
         needsRedraw = true
       of Key.Backspace:
@@ -1114,6 +1291,7 @@ proc main() {.async.} =
       of Key.Escape:
         fetchingAccountRelays = false
         appMode = AppMode.ModeRelay
+        if settingsActive: appMode = AppMode.ModeSettings
         needsRedraw = true
       of Key.Up, Key.K:
         if accountRelays.len > 0:
@@ -1140,6 +1318,28 @@ proc main() {.async.} =
           needsRedraw = true
       else: discard
 
+    elif appMode == AppMode.ModeSettings:
+      case key
+      of Key.Escape, Key.Q:
+        settingsActive = false
+        appMode = AppMode.ModeNormal
+        needsRedraw = true
+      of Key.R:
+        settingsActive = true
+        if relayConfigs.len > 0: relaySel = 0
+        appMode = AppMode.ModeRelay
+        needsRedraw = true
+      of Key.K:
+        settingsActive = true
+        appMode = AppMode.ModeKeyInput
+        keyInputBuffer = ""
+        needsRedraw = true
+        showTermCursor()
+      of Key.J:
+        japaneseOnly = not japaneseOnly
+        needsRedraw = true
+      else: discard
+
     # ModeInput / ModeMention are driven by the raw rune reader above.
 
     # --------------------------------------------------
@@ -1163,6 +1363,21 @@ proc main() {.async.} =
           
         tb.write(4, 6, "> " & maskedKey, illwill.fgCyan)
         tb.write(4, rows - 3, "Press [Enter] to Save & Start | [Esc] to Cancel", illwill.fgWhite)
+
+      elif appMode == AppMode.ModeSettings:
+        tb.write(2, 1, "Settings", illwill.fgYellow)
+        tb.write(2, 3, "Account key (nsec):", illwill.fgWhite)
+        let keyMask = if savedNsec != "": "nsec1" & "*".repeat(max(1, savedNsec.len - 8)) else: "(not set)"
+        tb.write(4, 4, keyMask, illwill.fgCyan)
+        tb.write(2, 6, "Japanese-only filter:", illwill.fgWhite)
+        tb.write(4, 7, if japaneseOnly: "ON" else: "OFF", illwill.fgCyan)
+        tb.write(2, 9, "Relays configured:", illwill.fgWhite)
+        tb.write(4, 10, $relayConfigs.len, illwill.fgCyan)
+        tb.drawHorizLine(2, cols - 3, 12)
+        tb.write(2, 13, "R  Manage relays (add / remove / read-write)", illwill.fgWhite)
+        tb.write(2, 14, "K  Change account key (nsec)", illwill.fgWhite)
+        tb.write(2, 15, "J  Toggle Japanese-only filter", illwill.fgWhite)
+        tb.write(2, rows - 3, fitToWidth("R:Relays  K:Key  J:Filter  Esc:Back to timeline", cols - 4), illwill.fgWhite)
 
       elif appMode == AppMode.ModeRelay:
         tb.write(2, 1, "Relays", illwill.fgYellow)
@@ -1225,15 +1440,20 @@ proc main() {.async.} =
         tb.drawHorizLine(1, cols - 2, rows - 4)
         
         if appMode == AppMode.ModeNormal:
-          tb.write(2, rows - 3, fitToWidth("i:Post S:Key R:Relays F:JP K/J:Scroll L:Live Q:Quit", cols - 4), illwill.fgWhite)
+          tb.write(2, rows - 3, fitToWidth("i:Post S:Settings R:Relays F:JP ←/→:Select e:React K/J:Scroll L:Live Ctrl+L:Reload Q:Quit", cols - 4), illwill.fgWhite)
         elif appMode == AppMode.ModeMention:
           tb.write(2, rows - 3, fitToWidth("↑/↓ select  Enter choose  Esc cancel", cols - 4), illwill.fgYellow)
+        elif appMode == AppMode.ModeReaction:
+          tb.write(2, rows - 3, fitToWidth("type emoji + Enter to react  Esc cancel", cols - 4), illwill.fgYellow)
+          let prompt = "react> "
+          writeLine(tb, 2, rows - 2, prompt, illwill.fgCyan)
+          writeLine(tb, 2 + prompt.len, rows - 2, reactionBuffer, illwill.fgWhite)
         else:
           tb.write(2, rows - 3, fitToWidth("TYPE MESSAGE + ENTER TO POST (ESC CANCEL)", cols - 4), illwill.fgYellow)
 
-        let prompt = "> "
-        writeLine(tb, 2, rows - 2, prompt, illwill.fgCyan)
-        writeLine(tb, 2 + prompt.len, rows - 2, displayContent(inputBuffer), illwill.fgWhite)
+          let prompt = "> "
+          writeLine(tb, 2, rows - 2, prompt, illwill.fgCyan)
+          writeLine(tb, 2 + prompt.len, rows - 2, displayContent(inputBuffer), illwill.fgWhite)
 
         # Build visible items list (respecting japaneseOnly filter)
         var visibleItems: seq[int] = @[]
@@ -1266,6 +1486,10 @@ proc main() {.async.} =
                               else:
                                 ev.pubkey[0..7]
 
+            let isSelected = (ev.id == selectedEventId) or
+                             (selectedEventId == "" and i == timeline.high)
+            let selColor = if isSelected: illwill.fgYellow else: illwill.fgCyan
+
             let namePart = fmt"[{displayName}]"
             let viaLabel = if ev.client != "": "· via " & ev.client & ": " else: ""
             let viaColor = if ev.client.toLowerAscii() == "nosterm": illwill.fgGreen
@@ -1279,7 +1503,7 @@ proc main() {.async.} =
             # Display name on its own line (top of the post block).
             let nameY = currentY - nLines + 1
             if nameY >= timelineTopY:
-              writeLine(tb, 1, nameY, namePart, illwill.fgCyan)
+              writeLine(tb, 1, nameY, namePart, selColor)
               tb[cols - 1, nameY] = borderChar
 
             # Content lines below; the first one carries the "via" badge.
@@ -1292,10 +1516,27 @@ proc main() {.async.} =
               let padStr = " ".repeat(padWidth)
               if li == 0 and viaLabel != "":
                 writeLine(tb, 1, y, viaLabel, viaColor)
-              writeLine(tb, 1 + viaPrefixWidth, y, contentPart & padStr, illwill.fgWhite)
+              writeLine(tb, 1 + viaPrefixWidth, y, contentPart & padStr,
+                        if isSelected: illwill.fgYellow else: illwill.fgWhite)
               tb[cols - 1, y] = borderChar
 
             currentY = currentY - nLines
+
+            # Reaction summary line (NIP-25), if any for this post.
+            if reactions.hasKey(ev.id):
+              let rs = reactions[ev.id]
+              var counts = initTable[string, int]()
+              for r in rs: counts[r.emoji] = counts.getOrDefault(r.emoji, 0) + 1
+              var parts: seq[string] = @[]
+              for k, v in pairs(counts): parts.add(k & " " & $v)
+              let reactLine = parts.join("  ")
+              if reactLine != "" and currentY >= timelineTopY:
+                let rused = displayWidth(reactLine)
+                let rpad = max(0, maxDisplayWidth - rused)
+                writeLine(tb, 1, currentY, reactLine & " ".repeat(rpad),
+                          if isSelected: illwill.fgYellow else: illwill.fgWhite)
+                tb[cols - 1, currentY] = borderChar
+                currentY -= 1
 
             # Separator line between posts (panel divider)
             if currentY >= timelineTopY:
@@ -1345,6 +1586,9 @@ proc main() {.async.} =
     if appMode == AppMode.ModeInput or appMode == AppMode.ModeMention:
       showTermCursor()
       setTermCursor(2 + 2 + displayWidth(displayContent(inputBuffer)), rows - 2)
+    elif appMode == AppMode.ModeReaction:
+      showTermCursor()
+      setTermCursor(2 + 7 + displayWidth(reactionBuffer), rows - 2)
     elif appMode == AppMode.ModeKeyInput:
       showTermCursor()
       setTermCursor(4 + 2 + keyInputBuffer.len, 6)
