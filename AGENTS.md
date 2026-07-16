@@ -41,6 +41,22 @@ display の代わりに使っています。
   防ぎます。セルモデルと行出力の整合を常に保ち、末尾のセルはスペースで埋めて
   古い内容が残らないようにしてください。
 
+### 描画の追加制約
+
+- **画面サイズ変更（SIGWINCH 等）**: メインループの `Key.None` 分岐で
+  `terminalSize()` を監視し、サイズが変わったら `tb = newTerminalBuffer(cols, rows)`
+  でバッファを作り直し、`needsRedraw = true` にします。`renderToTerminal` は
+  `prevScreen.len != H` を検知して全行の強制再描画を行います。サイズ変更時に
+  `prevScreen` を手動でクリアするロジックは不要です（自動で全行再描画）。
+- **強制再描画**: `forceRedraw = true` をセットすると次回の `renderToTerminal` が
+  `prevScreen` を空にして全行を書き直します。レイアウトが崩れた時の救済用で、
+  ノーマルモード等では `Ctrl+L`、テキスト入力モードでは `Ctrl+L`（生リーダで
+  制御文字 `0x0c` として届く）で発動します。新たに「全描画し直し」が必要な
+  経路を作る場合はこのフラグを使ってください。
+- **絵文字・特殊記号の幅**: `isWideRune` は現在 East Asian Wide の範囲のみを
+  2列としています。絵文字（Emoji）や合字は原則 1列扱いです。幅の解釈を勝手に
+  広げないでください（TUI で最もバグが出やすい箇所の一つです）。
+
 新しい画面出力を追加するときは `TerminalBuffer`（`tb`）を経由し、
 `renderToTerminal` に描画させてください。`setTermCursor` / `showTermCursor` /
 `hideTermCursor` 以外で直接 ANSI を stdout に書かないでください。
@@ -58,6 +74,30 @@ display の代わりに使っています。
 `ModeMention`、`ModeRelay`、`ModeRelayAdd`、`ModeRelayPick`。メインループは
 モードで分岐します。テキスト入力モードは生ルーンリーダを、それ以外は
 `illwill.getKeyWithTimeout` を使います。
+
+### 状態遷移とクリーンアップのルール
+
+モードを変更する際は、以下のクリーンアップを必ず行ってください（抜けが
+レイアウト崩れやカーソル残滞の原因になります）。
+
+- テキスト入力系モード（`ModeInput`/`ModeMention`/`ModeKeyInput`/`ModeRelayAdd`）
+  に**入る**ときは `showTermCursor()` を呼び、入力欄の位置へカーソルを移動させます。
+- これらのモードから**抜ける**（キャンセル含む）ときは `hideTermCursor()` を
+  呼び、必要なら `inputBuffer` / `keyInputBuffer` / `relayAddBuffer` を空にします。
+- メンション選択を抜けるときは `mentionAnchor = -1` に戻してください
+  （`handleInputRune` の `Esc`／`Enter`／投稿時に実施済み）。
+- モード遷移時は `needsRedraw = true` をセットして再描画を促してください。
+- カーソル表示は「テキスト入力系モードのみ表示・それ以外は非表示」が基本です。
+  毎フレーム `setTermCursor`/`showTermCursor`/`hideTermCursor` で位置と表示を
+  再設定しているため、モード別に散らばった `showTermCursor`/`hideTermCursor`
+  呼び出しは冗長ですが、遷移時に一貫して呼ぶことを優先してください。
+
+## 外部依存
+
+- 署名ライブラリ `secp256k1`（Nim バインディング）。環境によっては C の
+  `libsecp256k1` が必要です。Nim >= 2.2.10 で動作確認済み。
+- WebSocket は `ws`、TUI 基盤は `illwill`（※ 描画は自前の `renderToTerminal` を
+  使用、`tb.display()` は呼びません）、ハッシュは `nimSHA2`（SHA-256）。
 
 ## Nostr 固有の仕様
 

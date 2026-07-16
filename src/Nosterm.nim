@@ -89,6 +89,7 @@ proc writeLine(tb: var TerminalBuffer, x, y: int, text: string, color: illwill.F
 # whose content actually changed.
 # --------------------------------------------------
 var prevScreen: seq[string] = @[]
+var forceRedraw = false   # when set, the next render repaints every row
 
 proc sgrFor(fg: illwill.ForegroundColor, bg: illwill.BackgroundColor,
             style: set[illwill.Style]): string =
@@ -110,6 +111,9 @@ proc sgrFor(fg: illwill.ForegroundColor, bg: illwill.BackgroundColor,
 proc renderToTerminal(tb: var TerminalBuffer) =
   let H = tb.height
   let W = tb.width
+  if forceRedraw:
+    prevScreen = newSeq[string](H)
+    forceRedraw = false
   if prevScreen.len != H:
     prevScreen = newSeq[string](H)
   for y in 0 ..< H:
@@ -610,6 +614,11 @@ proc handleInputRune(ru: Rune) =
   # Ignore arrow-key sentinels (only meaningful in the mention picker).
   if ru == RuneUp or ru == RuneDown or ru == RuneLeft or ru == RuneRight:
     return
+  # Ctrl+L forces a full repaint.
+  if ru.ord == 12:
+    forceRedraw = true
+    needsRedraw = true
+    return
   if ru == Rune(int('\e')):
     appMode = AppMode.ModeNormal
     inputBuffer = ""
@@ -956,6 +965,12 @@ proc main() {.async.} =
           handleMentionRune(ru)
     else:
       key = getKeyWithTimeout(0)
+
+    # Ctrl+L forces a full repaint (handy when the layout gets corrupted).
+    if key == Key.CtrlL:
+      forceRedraw = true
+      needsRedraw = true
+      continue
 
     if appMode == AppMode.ModeKeyInput:
       case key
