@@ -3,3 +3,6 @@ nimble.develop
 nimble.paths
 nimbledeps
 Nosterm
+src/t_render
+src/t_render2
+src/t_wrap

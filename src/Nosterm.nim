@@ -146,7 +146,7 @@ proc renderToTerminal(tb: var TerminalBuffer) =
     if curText.len > 0: line &= curSgr & curText
     line &= "\e[0m"
     if y >= prevScreen.len or prevScreen[y] != line:
-      stdout.write("\e[" & $(y + 1) & ";1H" & line)
+      stdout.write("\e[" & $(y + 1) & ";1H" & line & "\e[K")
       prevScreen[y] = line
   flushFile(stdout)
 
