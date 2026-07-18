@@ -413,16 +413,15 @@ proc syncProfileFromRelays() =
 # Simple nsec obfuscation (XOR + base64, keyed per machine)
 # --------------------------------------------------
 proc machineKey(): string =
-  ## Derive a 32-byte key from hostname + username so the same user on the
+  ## Derive a 32-byte key from home dir + username so the same user on the
   ## same machine always gets the same key, but copying the config file to
-  ## another machine makes it unreadable.
-  let seed = gethostname() & "/" & getEnv("USER", getEnv("USERNAME", "nobody"))
-  var ctx: sha256
-  ctx.init()
-  ctx.update(seed)
-  let digest = ctx.final()
+  ## another machine/user makes it unreadable.
+  let seed = getHomeDir() & getEnv("USER", getEnv("USERNAME", "nobody"))
+  let h = computeSHA256(seed).hex
+  # Convert hex pairs to raw bytes for better XOR distribution.
   result = ""
-  for b in digest.data:
+  for i in countup(0, h.len - 2, 2):
+    let b = parseHexInt(h[i .. i+1])
     result.add(char(b))
 
 proc encryptNsec(nsec: string): string =
@@ -450,11 +449,13 @@ proc saveConfig() =
     var j = %*{}
     j["activeProfile"] = %* activeProfile
     j["activeAccount"] = %* activeAccount
-    # Save account names (nsec is never written to disk).
+    # Save account names + encrypted nsec.
     var accountsJson = newJArray()
     for ac in accounts:
       var a = %*{}
       a["name"] = %* ac.name
+      if ac.nsec != "":
+        a["nsec"] = %* encryptNsec(ac.nsec)
       accountsJson.add(a)
     j["accounts"] = accountsJson
     var profilesJson = newJArray()
@@ -489,10 +490,13 @@ proc loadConfig(): bool =
           let ns = j["nsec"].getStr()
           if decodeBech32(ns) != "":
             legacyNsec = ns
-        # Load accounts (names only; nsec is entered at runtime).
+        # Load accounts (names + encrypted nsec).
         if j.hasKey("accounts"):
           for a in j["accounts"]:
-            accounts.add(Account(name: a["name"].getStr(), nsec: ""))
+            var acNsec = ""
+            if a.hasKey("nsec"):
+              acNsec = decryptNsec(a["nsec"].getStr())
+            accounts.add(Account(name: a["name"].getStr(), nsec: acNsec))
           if j.hasKey("activeAccount"):
             activeAccount = j["activeAccount"].getInt()
             if activeAccount < 0 or activeAccount >= accounts.len:
