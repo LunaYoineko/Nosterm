@@ -1,4 +1,4 @@
-import std/[asyncdispatch, json, strformat, os, strutils, times, tables, unicode, random]
+import std/[asyncdispatch, json, strformat, os, strutils, times, tables, unicode, random, base64]
 import std/terminal
 from posix import poll, read, TPollFd
 import ws, illwill
@@ -304,6 +304,10 @@ type
     ModeRelay,    # Relay manager
     ModeRelayAdd, # Adding a relay (URL input)
     ModeRelayPick, # Picking relays from the account's kind 10002 list
+    ModeRelayProfile,    # Profile selector
+    ModeRelayProfileAdd, # Profile name input
+    ModeAccount,         # Account selector
+    ModeAccountAdd,      # Account name input
     ModeReaction,  # Reaction emoji input mode
     ModeSettings    # Standalone settings window (relays, key, filters)
 
@@ -361,6 +365,12 @@ type
     write: bool
     ws: WebSocket
     gen: int
+  RelayProfile = object
+    name: string
+    relays: seq[RelayConfig]
+  Account = object
+    nsec: string     # bech32 secret key (not written to disk)
+    name: string     # display name for local identification
 
 var relayConfigs: seq[RelayConfig] = @[]   # persisted relay settings
 var relayConns: seq[RelayConn] = @[]       # active connections (for sending)
@@ -370,6 +380,14 @@ var relayAddBuffer = ""                    # text typed when adding a relay
 var accountRelays: seq[tuple[url: string, read: bool, write: bool]] = @[]  # candidates from kind 10002
 var fetchingAccountRelays = false
 var relayPickSel = 0                        # selected candidate in pick screen
+var relayProfiles: seq[RelayProfile] = @[]  # relay profiles
+var activeProfile: int = 0                  # index of the active profile
+var profileSel: int = 0                     # selected profile in the profile list
+var profileNameBuffer: string = ""          # text typed when naming a new profile
+var accounts: seq[Account] = @[]            # account list
+var activeAccount: int = 0                  # index of the active account
+var accountSel: int = 0                     # selected account in the list
+var accountNameBuffer: string = ""          # text typed when naming a new account
 
 # --------------------------------------------------
 # Cleanup procedure
@@ -379,21 +397,80 @@ proc exitProc() {.noconv.} =
   showTermCursor()
   quit(0)
 
+# Keep relayConfigs in sync with the active profile.
+proc syncProfileRelays() =
+  if relayProfiles.len > 0 and activeProfile >= 0 and activeProfile < relayProfiles.len:
+    relayConfigs = relayProfiles[activeProfile].relays
+  else:
+    relayConfigs = @[]
+
+# Write relayConfigs changes back into the active profile.
+proc syncProfileFromRelays() =
+  if relayProfiles.len > 0 and activeProfile >= 0 and activeProfile < relayProfiles.len:
+    relayProfiles[activeProfile].relays = relayConfigs
+
+# --------------------------------------------------
+# Simple nsec obfuscation (XOR + base64, keyed per machine)
+# --------------------------------------------------
+proc machineKey(): string =
+  ## Derive a 32-byte key from hostname + username so the same user on the
+  ## same machine always gets the same key, but copying the config file to
+  ## another machine makes it unreadable.
+  let seed = gethostname() & "/" & getEnv("USER", getEnv("USERNAME", "nobody"))
+  var ctx: sha256
+  ctx.init()
+  ctx.update(seed)
+  let digest = ctx.final()
+  result = ""
+  for b in digest.data:
+    result.add(char(b))
+
+proc encryptNsec(nsec: string): string =
+  let key = machineKey()
+  var enc = newSeq[byte](nsec.len)
+  for i in 0 ..< nsec.len:
+    enc[i] = byte(nsec[i]) xor byte(key[i mod key.len])
+  result = "enc:" & base64.encode(enc)
+
+proc decryptNsec(encoded: string): string =
+  if not encoded.startsWith("enc:"):
+    return encoded  # legacy plain text
+  let payload = base64.decode(encoded[4 ..^ 1])
+  let key = machineKey()
+  var dec = newSeq[byte](payload.len)
+  for i in 0 ..< payload.len:
+    dec[i] = byte(payload[i]) xor byte(key[i mod key.len])
+  result = cast[string](dec)
+
 # --------------------------------------------------
 # 2. Config file read/write (JSON: nsec + relays)
 # --------------------------------------------------
 proc saveConfig() =
   try:
     var j = %*{}
-    j["nsec"] = %* savedNsec
-    var relaysJson = newJArray()
-    for rc in relayConfigs:
-      var r = %*{}
-      r["url"] = %* rc.url
-      r["read"] = %* rc.read
-      r["write"] = %* rc.write
-      relaysJson.add(r)
-    j["relays"] = relaysJson
+    j["activeProfile"] = %* activeProfile
+    j["activeAccount"] = %* activeAccount
+    # Save account names (nsec is never written to disk).
+    var accountsJson = newJArray()
+    for ac in accounts:
+      var a = %*{}
+      a["name"] = %* ac.name
+      accountsJson.add(a)
+    j["accounts"] = accountsJson
+    var profilesJson = newJArray()
+    for rp in relayProfiles:
+      var p = %*{}
+      p["name"] = %* rp.name
+      var relaysJson = newJArray()
+      for rc in rp.relays:
+        var r = %*{}
+        r["url"] = %* rc.url
+        r["read"] = %* rc.read
+        r["write"] = %* rc.write
+        relaysJson.add(r)
+      p["relays"] = relaysJson
+      profilesJson.add(p)
+    j["profiles"] = profilesJson
     writeFile(configPath, $j)
     discard execShellCmd("chmod 600 " & quoteShell(configPath))
   except CatchableError:
@@ -406,30 +483,81 @@ proc loadConfig(): bool =
     if txt.startsWith("{"):
       try:
         let j = parseJson(txt)
+        # Legacy: top-level "nsec" field.
+        var legacyNsec = ""
         if j.hasKey("nsec"):
           let ns = j["nsec"].getStr()
-          let hex = decodeBech32(ns)
-          if hex != "":
-            savedNsec = ns
-            savedSecKeyHex = hex
-            result = true
-        if j.hasKey("relays"):
+          if decodeBech32(ns) != "":
+            legacyNsec = ns
+        # Load accounts (names only; nsec is entered at runtime).
+        if j.hasKey("accounts"):
+          for a in j["accounts"]:
+            accounts.add(Account(name: a["name"].getStr(), nsec: ""))
+          if j.hasKey("activeAccount"):
+            activeAccount = j["activeAccount"].getInt()
+            if activeAccount < 0 or activeAccount >= accounts.len:
+              activeAccount = 0
+        # Load relay profiles.
+        if j.hasKey("profiles"):
+          for p in j["profiles"]:
+            var rels: seq[RelayConfig] = @[]
+            if p.hasKey("relays"):
+              for r in p["relays"]:
+                rels.add(RelayConfig(
+                  url: r["url"].getStr(),
+                  read: if r.hasKey("read"): r["read"].getBool() else: true,
+                  write: if r.hasKey("write"): r["write"].getBool() else: true))
+            relayProfiles.add(RelayProfile(name: p["name"].getStr(), relays: rels))
+          if j.hasKey("activeProfile"):
+            activeProfile = j["activeProfile"].getInt()
+            if activeProfile < 0 or activeProfile >= relayProfiles.len:
+              activeProfile = 0
+          if relayProfiles.len > 0:
+            syncProfileRelays()
+        elif j.hasKey("relays"):
+          # Legacy format: migrate old flat relays into a "Default" profile.
+          var rels: seq[RelayConfig] = @[]
           for r in j["relays"]:
-            relayConfigs.add(RelayConfig(
+            rels.add(RelayConfig(
               url: r["url"].getStr(),
               read: if r.hasKey("read"): r["read"].getBool() else: true,
               write: if r.hasKey("write"): r["write"].getBool() else: true))
+          relayProfiles.add(RelayProfile(name: "Default", relays: rels))
+          activeProfile = 0
+          syncProfileRelays()
+        # Migrate legacy nsec into an account.
+        if legacyNsec != "":
+          if accounts.len == 0:
+            accounts.add(Account(name: "Default", nsec: legacyNsec))
+            activeAccount = 0
+          elif activeAccount < accounts.len and accounts[activeAccount].nsec == "":
+            accounts[activeAccount].nsec = legacyNsec
+        # Load the active account's nsec into globals.
+        if activeAccount < accounts.len and accounts[activeAccount].nsec != "":
+          let hex = decodeBech32(accounts[activeAccount].nsec)
+          if hex != "":
+            savedNsec = accounts[activeAccount].nsec
+            savedSecKeyHex = hex
+            result = true
       except CatchableError:
         discard
     elif txt.startsWith("nsec1"):
       # Migrate legacy single-nsec config.
       let hex = decodeBech32(txt)
       if hex != "":
+        accounts.add(Account(name: "Default", nsec: txt))
+        activeAccount = 0
+        relayProfiles.add(RelayProfile(name: "Default", relays: @[]))
+        activeProfile = 0
+        syncProfileRelays()
         savedNsec = txt
         savedSecKeyHex = hex
         result = true
-  if relayConfigs.len == 0:
-    relayConfigs.add(RelayConfig(url: "wss://yabu.me", read: true, write: true))
+  if relayProfiles.len == 0:
+    relayProfiles.add(RelayProfile(name: "Default", relays: @[
+      RelayConfig(url: "wss://yabu.me", read: true, write: true)]))
+    activeProfile = 0
+    syncProfileRelays()
 
 # Apply a freshly typed nsec: decode, store, persist.
 proc applyNsec(nsec: string): bool =
@@ -438,6 +566,12 @@ proc applyNsec(nsec: string): bool =
     return false
   savedNsec = nsec
   savedSecKeyHex = hex
+  # Ensure there is an account to store the nsec.
+  if accounts.len == 0:
+    accounts.add(Account(name: "Default", nsec: nsec))
+    activeAccount = 0
+  elif activeAccount >= 0 and activeAccount < accounts.len:
+    accounts[activeAccount].nsec = nsec
   # Derive our own pubkey so we can fetch the account's relay list (kind 10002).
   let skRes = SkSecretKey.fromHex(savedSecKeyHex)
   if skRes.isOk:
@@ -1209,6 +1343,10 @@ proc main() {.async.} =
         if relayConfigs.len > 0: relaySel = 0
         appMode = AppMode.ModeRelay
         needsRedraw = true
+      of Key.A:
+        if accounts.len > 0: accountSel = activeAccount
+        appMode = AppMode.ModeAccount
+        needsRedraw = true
       of Key.None:
         let (newCols, newRows) = terminalSize()
         if newCols > 0 and newRows > 0 and (newCols != cols or newRows != rows):
@@ -1236,12 +1374,12 @@ proc main() {.async.} =
       of Key.R:
         if relayConfigs.len > 0:
           relayConfigs[relaySel].read = not relayConfigs[relaySel].read
-          saveConfig(); applyRelayConfig()
+          syncProfileFromRelays(); saveConfig(); applyRelayConfig()
           needsRedraw = true
       of Key.W:
         if relayConfigs.len > 0:
           relayConfigs[relaySel].write = not relayConfigs[relaySel].write
-          saveConfig(); applyRelayConfig()
+          syncProfileFromRelays(); saveConfig(); applyRelayConfig()
           needsRedraw = true
       of Key.A:
         relayAddBuffer = ""
@@ -1252,10 +1390,14 @@ proc main() {.async.} =
         if relayConfigs.len > 0:
           relayConfigs.delete(relaySel)
           if relaySel >= relayConfigs.len: relaySel = max(0, relayConfigs.len - 1)
-          saveConfig(); applyRelayConfig()
+          syncProfileFromRelays(); saveConfig(); applyRelayConfig()
           needsRedraw = true
       of Key.F:
         fetchAccountRelays()
+      of Key.P:
+        if relayProfiles.len > 0: profileSel = activeProfile
+        appMode = AppMode.ModeRelayProfile
+        needsRedraw = true
       else: discard
 
     elif appMode == AppMode.ModeRelayAdd:
@@ -1269,7 +1411,7 @@ proc main() {.async.} =
         let url = relayAddBuffer.strip()
         if url.startsWith("wss://") or url.startsWith("ws://"):
           relayConfigs.add(RelayConfig(url: url, read: true, write: true))
-          saveConfig(); applyRelayConfig()
+          syncProfileFromRelays(); saveConfig(); applyRelayConfig()
         appMode = AppMode.ModeRelay
         if settingsActive: appMode = AppMode.ModeSettings
         hideTermCursor()
@@ -1311,18 +1453,171 @@ proc main() {.async.} =
               break
           if not found:
             relayConfigs.add(RelayConfig(url: cand.url, read: cand.read, write: cand.write))
-            saveConfig(); applyRelayConfig()
+            syncProfileFromRelays(); saveConfig(); applyRelayConfig()
           accountRelays.delete(relayPickSel)
           if relayPickSel >= accountRelays.len:
             relayPickSel = max(0, accountRelays.len - 1)
           needsRedraw = true
       else: discard
 
+    elif appMode == AppMode.ModeRelayProfile:
+      case key
+      of Key.Escape:
+        appMode = AppMode.ModeRelay
+        needsRedraw = true
+      of Key.Up, Key.K:
+        if relayProfiles.len > 0:
+          profileSel = (profileSel + relayProfiles.len - 1) mod relayProfiles.len
+          needsRedraw = true
+      of Key.Down, Key.J:
+        if relayProfiles.len > 0:
+          profileSel = (profileSel + 1) mod relayProfiles.len
+          needsRedraw = true
+      of Key.Enter:
+        if relayProfiles.len > 0 and profileSel < relayProfiles.len:
+          activeProfile = profileSel
+          syncProfileRelays()
+          saveConfig(); applyRelayConfig()
+          relaySel = 0
+          appMode = AppMode.ModeRelay
+          needsRedraw = true
+      of Key.N:
+        profileNameBuffer = ""
+        appMode = AppMode.ModeRelayProfileAdd
+        needsRedraw = true
+        showTermCursor()
+      of Key.D:
+        if relayProfiles.len > 1 and profileSel < relayProfiles.len:
+          relayProfiles.delete(profileSel)
+          if activeProfile >= relayProfiles.len:
+            activeProfile = max(0, relayProfiles.len - 1)
+          if profileSel >= relayProfiles.len:
+            profileSel = max(0, relayProfiles.len - 1)
+          syncProfileRelays()
+          saveConfig(); applyRelayConfig()
+          needsRedraw = true
+      else: discard
+
+    elif appMode == AppMode.ModeRelayProfileAdd:
+      case key
+      of Key.Escape:
+        appMode = AppMode.ModeRelayProfile
+        hideTermCursor()
+        needsRedraw = true
+      of Key.Enter:
+        let name = profileNameBuffer.strip()
+        if name.len > 0:
+          relayProfiles.add(RelayProfile(name: name, relays: @[]))
+          profileSel = relayProfiles.len - 1
+          activeProfile = profileSel
+          syncProfileRelays()
+          saveConfig(); applyRelayConfig()
+        appMode = AppMode.ModeRelayProfile
+        hideTermCursor()
+        needsRedraw = true
+      of Key.Backspace:
+        if profileNameBuffer.len > 0:
+          profileNameBuffer.setLen(profileNameBuffer.len - 1)
+          needsRedraw = true
+      of Key.None: discard
+      else:
+        if key != Key.None:
+          let keyChar = chr(int(key))
+          if keyChar != '\0' and keyChar != '\n' and keyChar != '\r':
+            profileNameBuffer.add(keyChar)
+            needsRedraw = true
+
+    elif appMode == AppMode.ModeAccount:
+      case key
+      of Key.Escape:
+        appMode = AppMode.ModeNormal
+        needsRedraw = true
+      of Key.Up, Key.K:
+        if accounts.len > 0:
+          accountSel = (accountSel + accounts.len - 1) mod accounts.len
+          needsRedraw = true
+      of Key.Down, Key.J:
+        if accounts.len > 0:
+          accountSel = (accountSel + 1) mod accounts.len
+          needsRedraw = true
+      of Key.Enter:
+        if accounts.len > 0 and accountSel < accounts.len:
+          activeAccount = accountSel
+          let ns = accounts[activeAccount].nsec
+          if ns != "":
+            let hex = decodeBech32(ns)
+            if hex != "":
+              savedNsec = ns
+              savedSecKeyHex = hex
+              let skRes = SkSecretKey.fromHex(savedSecKeyHex)
+              if skRes.isOk:
+                myPubkeyHex = $skRes.value.toPublicKey().toXOnly()
+          else:
+            savedNsec = ""
+            savedSecKeyHex = ""
+            myPubkeyHex = ""
+          saveConfig(); applyRelayConfig()
+          appMode = AppMode.ModeNormal
+          needsRedraw = true
+      of Key.N:
+        accountNameBuffer = ""
+        appMode = AppMode.ModeAccountAdd
+        needsRedraw = true
+        showTermCursor()
+      of Key.S:
+        if accounts.len > 0 and accountSel < accounts.len:
+          keyInputBuffer = ""
+          appMode = AppMode.ModeKeyInput
+          needsRedraw = true
+          showTermCursor()
+      of Key.D:
+        if accounts.len > 1 and accountSel < accounts.len:
+          accounts.delete(accountSel)
+          if activeAccount >= accounts.len:
+            activeAccount = max(0, accounts.len - 1)
+          if accountSel >= accounts.len:
+            accountSel = max(0, accounts.len - 1)
+          saveConfig()
+          needsRedraw = true
+      else: discard
+
+    elif appMode == AppMode.ModeAccountAdd:
+      case key
+      of Key.Escape:
+        appMode = AppMode.ModeAccount
+        hideTermCursor()
+        needsRedraw = true
+      of Key.Enter:
+        let name = accountNameBuffer.strip()
+        if name.len > 0:
+          accounts.add(Account(name: name, nsec: ""))
+          accountSel = accounts.len - 1
+          activeAccount = accountSel
+          saveConfig()
+        appMode = AppMode.ModeAccount
+        hideTermCursor()
+        needsRedraw = true
+      of Key.Backspace:
+        if accountNameBuffer.len > 0:
+          accountNameBuffer.setLen(accountNameBuffer.len - 1)
+          needsRedraw = true
+      of Key.None: discard
+      else:
+        if key != Key.None:
+          let keyChar = chr(int(key))
+          if keyChar != '\0' and keyChar != '\n' and keyChar != '\r':
+            accountNameBuffer.add(keyChar)
+            needsRedraw = true
+
     elif appMode == AppMode.ModeSettings:
       case key
       of Key.Escape, Key.Q:
         settingsActive = false
         appMode = AppMode.ModeNormal
+        needsRedraw = true
+      of Key.A:
+        if accounts.len > 0: accountSel = activeAccount
+        appMode = AppMode.ModeAccount
         needsRedraw = true
       of Key.R:
         settingsActive = true
@@ -1372,15 +1667,18 @@ proc main() {.async.} =
         tb.write(2, 6, "Japanese-only filter:", illwill.fgWhite)
         tb.write(4, 7, if japaneseOnly: "ON" else: "OFF", illwill.fgCyan)
         tb.write(2, 9, "Relays configured:", illwill.fgWhite)
-        tb.write(4, 10, $relayConfigs.len, illwill.fgCyan)
+        let profName = if activeProfile < relayProfiles.len: relayProfiles[activeProfile].name else: "Default"
+        tb.write(4, 10, $relayConfigs.len & " (profile: " & profName & ")", illwill.fgCyan)
         tb.drawHorizLine(2, cols - 3, 12)
-        tb.write(2, 13, "R  Manage relays (add / remove / read-write)", illwill.fgWhite)
-        tb.write(2, 14, "K  Change account key (nsec)", illwill.fgWhite)
-        tb.write(2, 15, "J  Toggle Japanese-only filter", illwill.fgWhite)
-        tb.write(2, rows - 3, fitToWidth("R:Relays  K:Key  J:Filter  Esc:Back to timeline", cols - 4), illwill.fgWhite)
+        tb.write(2, 13, "A  Manage accounts", illwill.fgWhite)
+        tb.write(2, 14, "R  Manage relays (add / remove / read-write)", illwill.fgWhite)
+        tb.write(2, 15, "K  Change account key (nsec)", illwill.fgWhite)
+        tb.write(2, 16, "J  Toggle Japanese-only filter", illwill.fgWhite)
+        tb.write(2, rows - 3, fitToWidth("A:Accounts  R:Relays  K:Key  J:Filter  Esc:Back to timeline", cols - 4), illwill.fgWhite)
 
       elif appMode == AppMode.ModeRelay:
-        tb.write(2, 1, "Relays", illwill.fgYellow)
+        let profName = if activeProfile < relayProfiles.len: relayProfiles[activeProfile].name else: "Default"
+        tb.write(2, 1, "Relays [" & profName & "]", illwill.fgYellow)
         tb.write(2, 2, fmt" {relayConfigs.len} configured", illwill.fgWhite)
         let listTop = 4
         for idx in 0 ..< relayConfigs.len:
@@ -1401,7 +1699,7 @@ proc main() {.async.} =
           lineStr = fitToWidth(lineStr, cols - 4)
           if sel: writeLine(tb, 2, y, lineStr, illwill.fgYellow)
           else: writeLine(tb, 2, y, lineStr, illwill.fgWhite)
-        tb.write(2, rows - 3, fitToWidth("↑/↓ select  r:Read  w:Write  a:Add  d:Delete  f:Fetch acct  Esc:Back", cols - 4), illwill.fgWhite)
+        tb.write(2, rows - 3, fitToWidth("↑/↓ select  r:Read  w:Write  a:Add  d:Delete  p:Profiles  Esc:Back", cols - 4), illwill.fgWhite)
 
       elif appMode == AppMode.ModeRelayAdd:
         tb.write(2, 1, "Add Relay", illwill.fgYellow)
@@ -1431,6 +1729,57 @@ proc main() {.async.} =
             if sel: writeLine(tb, 2, y, lineStr, illwill.fgYellow)
             else: writeLine(tb, 2, y, lineStr, illwill.fgWhite)
           tb.write(2, rows - 3, fitToWidth("↑/↓ select  Enter add  Esc back", cols - 4), illwill.fgWhite)
+
+      elif appMode == AppMode.ModeRelayProfile:
+        tb.write(2, 1, "Relay Profiles", illwill.fgYellow)
+        tb.write(2, 2, fmt" {relayProfiles.len} profiles", illwill.fgWhite)
+        let listTop = 4
+        for idx in 0 ..< relayProfiles.len:
+          let y = listTop + idx
+          if y >= rows - 3: break
+          let rp = relayProfiles[idx]
+          let sel = (idx == profileSel)
+          let active = (idx == activeProfile)
+          let mark = if sel: "▶ " else: "  "
+          let activeMark = if active: "● " else: "○ "
+          var lineStr = mark & activeMark & rp.name & "  (" & $rp.relays.len & " relays)"
+          lineStr = fitToWidth(lineStr, cols - 4)
+          if sel: writeLine(tb, 2, y, lineStr, illwill.fgYellow)
+          else: writeLine(tb, 2, y, lineStr, illwill.fgWhite)
+        tb.write(2, rows - 3, fitToWidth("↑/↓ select  Enter activate  n:New  d:Delete  Esc:Back", cols - 4), illwill.fgWhite)
+
+      elif appMode == AppMode.ModeRelayProfileAdd:
+        tb.write(2, 1, "New Relay Profile", illwill.fgYellow)
+        tb.write(2, 3, "Profile name:", illwill.fgWhite)
+        tb.drawHorizLine(2, cols - 3, 5)
+        tb.write(4, 4, "> " & profileNameBuffer, illwill.fgCyan)
+        tb.write(2, rows - 3, "Press [Enter] to Create | [Esc] to Cancel", illwill.fgWhite)
+
+      elif appMode == AppMode.ModeAccount:
+        tb.write(2, 1, "Accounts", illwill.fgYellow)
+        tb.write(2, 2, fmt" {accounts.len} configured", illwill.fgWhite)
+        let listTop = 4
+        for idx in 0 ..< accounts.len:
+          let y = listTop + idx
+          if y >= rows - 3: break
+          let ac = accounts[idx]
+          let sel = (idx == accountSel)
+          let active = (idx == activeAccount)
+          let mark = if sel: "▶ " else: "  "
+          let activeMark = if active: "● " else: "○ "
+          let keyStatus = if ac.nsec != "": "key set" else: "no key"
+          var lineStr = mark & activeMark & ac.name & "  (" & keyStatus & ")"
+          lineStr = fitToWidth(lineStr, cols - 4)
+          if sel: writeLine(tb, 2, y, lineStr, illwill.fgYellow)
+          else: writeLine(tb, 2, y, lineStr, illwill.fgWhite)
+        tb.write(2, rows - 3, fitToWidth("↑/↓ select  Enter switch  n:New  s:Set key  d:Delete  Esc:Back", cols - 4), illwill.fgWhite)
+
+      elif appMode == AppMode.ModeAccountAdd:
+        tb.write(2, 1, "New Account", illwill.fgYellow)
+        tb.write(2, 3, "Account name:", illwill.fgWhite)
+        tb.drawHorizLine(2, cols - 3, 5)
+        tb.write(4, 4, "> " & accountNameBuffer, illwill.fgCyan)
+        tb.write(2, rows - 3, "Press [Enter] to Create | [Esc] to Cancel", illwill.fgWhite)
 
       else:
         let statusText = if scrollOffset == 0: "[ LIVE - Tracking Latest ]" else: fmt"[ Scroll: {scrollOffset} (Press 'L' to Live) ]"
@@ -1595,6 +1944,12 @@ proc main() {.async.} =
     elif appMode == AppMode.ModeRelayAdd:
       showTermCursor()
       setTermCursor(4 + 2 + relayAddBuffer.len, 4)
+    elif appMode == AppMode.ModeRelayProfileAdd:
+      showTermCursor()
+      setTermCursor(4 + 2 + profileNameBuffer.len, 4)
+    elif appMode == AppMode.ModeAccountAdd:
+      showTermCursor()
+      setTermCursor(4 + 2 + accountNameBuffer.len, 4)
     else:
       hideTermCursor()
 
