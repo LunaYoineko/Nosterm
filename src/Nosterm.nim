@@ -315,6 +315,8 @@ var timeline: seq[NostrEvent] = @[]
 var profileCache = initTable[string, string]()  # pubkey(lowercase) -> display name
 # Reactions (NIP-25): event id -> list of (emoji, reactor pubkey).
 var reactions = initTable[string, seq[tuple[emoji: string, pubkey: string]]]()
+# Custom emoji (NIP-30): shortname -> image URL (e.g. "yakitofu" -> "https://...")
+var customEmojiUrls = initTable[string, string]()
 var selectedEventId = ""   # currently focused post (for reacting); "" = newest
 var reactionBuffer = ""    # emoji being typed in ModeReaction
 var settingsActive = false  # true when relay/key sub-modes were opened from Settings
@@ -472,6 +474,12 @@ proc saveConfig() =
       p["relays"] = relaysJson
       profilesJson.add(p)
     j["profiles"] = profilesJson
+    # Custom emoji URLs (NIP-30).
+    if customEmojiUrls.len > 0:
+      var emojiJson = %*{}
+      for name, url in customEmojiUrls:
+        emojiJson[name] = %* url
+      j["customEmoji"] = emojiJson
     writeFile(configPath, $j)
     discard execShellCmd("chmod 600 " & quoteShell(configPath))
   except CatchableError:
@@ -543,6 +551,10 @@ proc loadConfig(): bool =
             savedNsec = accounts[activeAccount].nsec
             savedSecKeyHex = hex
             result = true
+        # Load custom emoji URLs.
+        if j.hasKey("customEmoji"):
+          for name, url in j["customEmoji"]:
+            customEmojiUrls[name] = url.getStr()
       except CatchableError:
         discard
     elif txt.startsWith("nsec1"):
@@ -596,6 +608,29 @@ proc sendReaction(targetId, targetAuthor, emoji: string) {.async.}
 proc moveSelection(delta: int)
 proc currentSelectedEvent(): NostrEvent
 
+# Extract :shortname: tokens from content for NIP-30 custom emoji tags.
+proc extractCustomEmoji(content: string): seq[string] =
+  result = @[]
+  var i = 0
+  while i < content.len:
+    if content[i] == ':' and i + 2 < content.len:
+      var j = i + 1
+      while j < content.len and content[j] != ':' and content[j] != ' ' and content[j] != '\n':
+        j.inc
+      if j < content.len and content[j] == ':' and j > i + 1:
+        let name = content[(i+1) ..< j]
+        if name.len >= 2 and name.len <= 30:
+          var found = false
+          for existing in result:
+            if existing == name: found = true; break
+          if not found:
+            result.add(name)
+        i = j + 1
+      else:
+        i.inc
+    else:
+      i.inc
+
 proc sendNostrPost(content: string, mentions: seq[string] = @[]) {.async.} =
   if savedSecKeyHex == "": return
 
@@ -613,6 +648,10 @@ proc sendNostrPost(content: string, mentions: seq[string] = @[]) {.async.} =
   # Nostr mentions: one ["p", "<pubkey hex>"] tag per mentioned user.
   for m in mentions:
     tags.add(%* ["p", m])
+  # Custom emoji (NIP-30): ["emoji", "<shortname>", "<url>"] tags.
+  for emojiName in extractCustomEmoji(content):
+    let url = if customEmojiUrls.hasKey(emojiName): customEmojiUrls[emojiName] else: ""
+    tags.add(%* ["emoji", emojiName, url])
   
   let serializeArray = %*[
     0, pubkeyHex, createdAt, 1, tags, content
@@ -981,6 +1020,12 @@ proc processPacket(packet: string) =
               if t.kind == JArray and t.len >= 2:
                 if t[0].getStr() == "client":
                   clientName = t[1].getStr()
+                # Cache custom emoji URLs from NIP-30 tags.
+                elif t[0].getStr() == "emoji" and t.len >= 3:
+                  let emName = t[1].getStr()
+                  let emUrl = t[2].getStr()
+                  if emName != "" and emUrl != "" and not customEmojiUrls.hasKey(emName):
+                    customEmojiUrls[emName] = emUrl
           let newEvent = NostrEvent(id: eventId, pubkey: pubkey, content: content,
                                    createdAt: createdAt, client: clientName)
           insertEvent(newEvent)
