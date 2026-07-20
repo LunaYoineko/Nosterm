@@ -63,23 +63,63 @@ proc fitToWidth(s: string, maxW: int): string =
 # terminal column. A full-width char occupies 2 columns, so for it we write
 # the rune to cell cx and a NUL placeholder to cx+1 (the renderer skips the
 # placeholder when emitting the glyph).
-proc writeLine(tb: var TerminalBuffer, x, y: int, text: string, color: illwill.ForegroundColor) =
+proc writeLine(tb: var TerminalBuffer, x, y: int, text: string, color: illwill.ForegroundColor,
+               maxX: int = -1) =
   if y < 0 or y >= tb.height: return
+  let limit = if maxX >= 0: min(maxX, tb.width - 1) else: tb.width - 1
   var cx = x
   for r in text.toRunes:
     if isWideRune(r):
-      if cx + 1 >= tb.width - 1: break   # protect right border
+      if cx + 1 >= limit: break
       tb[cx, y] = TerminalChar(ch: r, fg: color, bg: bgNone, style: {})
       tb[cx + 1, y] = TerminalChar(ch: Rune(0), fg: color, bg: bgNone, style: {})
       cx += 2
     else:
-      if cx >= tb.width - 1: break        # stop at right border
+      if cx >= limit: break
       tb[cx, y] = TerminalChar(ch: r, fg: color, bg: bgNone, style: {})
       cx += 1
-  # Pad the remainder of the line with spaces so stale cells are cleared.
-  while cx < tb.width - 1:
+  # Pad the remainder so stale cells are cleared, but stop before maxX.
+  while cx < limit:
     tb[cx, y] = TerminalChar(ch: Rune(32), fg: color, bg: bgNone, style: {})
     cx += 1
+
+# Draw a rounded-corner box (╭─╮│╰─╯) into the terminal buffer.
+# The interior is filled with spaces. Title is rendered on the top border
+# when non-nil. borderColor defaults to fgWhite. All coordinates are clamped
+# to the terminal buffer size so the caller never writes out of bounds.
+proc drawRoundedBox(tb: var TerminalBuffer, x1, y1, x2, y2: int,
+                    title: string = "",
+                    borderColor: illwill.ForegroundColor = illwill.fgWhite) =
+  # Clamp to valid terminal area (0 .. width-1, 0 .. height-1).
+  let bx1 = clamp(x1, 0, tb.width - 3)
+  let by1 = clamp(y1, 0, tb.height - 3)
+  let bx2 = clamp(x2, bx1 + 2, tb.width - 1)
+  let by2 = clamp(y2, by1 + 2, tb.height - 1)
+  # Corners
+  tb[bx1, by1] = TerminalChar(ch: Rune(0x256D), fg: borderColor, bg: bgNone, style: {})
+  tb[bx2, by1] = TerminalChar(ch: Rune(0x256E), fg: borderColor, bg: bgNone, style: {})
+  tb[bx1, by2] = TerminalChar(ch: Rune(0x2570), fg: borderColor, bg: bgNone, style: {})
+  tb[bx2, by2] = TerminalChar(ch: Rune(0x256F), fg: borderColor, bg: bgNone, style: {})
+  # Top / bottom edges
+  for x in (bx1 + 1) ..< bx2:
+    tb[x, by1] = TerminalChar(ch: Rune(0x2500), fg: borderColor, bg: bgNone, style: {})
+    tb[x, by2] = TerminalChar(ch: Rune(0x2500), fg: borderColor, bg: bgNone, style: {})
+  # Left / right edges
+  for y in (by1 + 1) ..< by2:
+    tb[bx1, y] = TerminalChar(ch: Rune(0x2502), fg: borderColor, bg: bgNone, style: {})
+    tb[bx2, y] = TerminalChar(ch: Rune(0x2502), fg: borderColor, bg: bgNone, style: {})
+  # Interior fill
+  for y in (by1 + 1) ..< by2:
+    for x in (bx1 + 1) ..< bx2:
+      tb[x, y] = TerminalChar(ch: Rune(' '), fg: illwill.fgWhite, bg: bgNone, style: {})
+  # Title on top border
+  if title != "":
+    let titleStr = " " & title & " "
+    var tx = bx1 + 2
+    for ch in titleStr:
+      if tx >= bx2: break
+      tb[tx, by1] = TerminalChar(ch: Rune(ch), fg: illwill.fgYellow, bg: bgNone, style: {})
+      tx.inc
 
 # --------------------------------------------------
 # Custom wide-char-aware renderer.
@@ -295,6 +335,7 @@ type
     content: string   # Note content
     createdAt: int64  # Creation timestamp (Unix time, for sorting)
     client: string    # Client name from the ["client", name] tag ("" if none)
+    replyToId: string # Event ID this post replies to ("" if top-level)
 
   AppMode = enum
     ModeNormal,   # Browse/scroll mode
@@ -318,6 +359,8 @@ var reactions = initTable[string, seq[tuple[emoji: string, pubkey: string]]]()
 # Custom emoji (NIP-30): shortname -> image URL (e.g. "yakitofu" -> "https://...")
 var customEmojiUrls = initTable[string, string]()
 var selectedEventId = ""   # currently focused post (for reacting); "" = newest
+var replyToId = ""         # event ID being replied to ("" = new top-level post)
+var replyToAuthor = ""     # pubkey of the author being replied to
 var reactionBuffer = ""    # emoji being typed in ModeReaction
 var settingsActive = false  # true when relay/key sub-modes were opened from Settings
 var needsRedraw = true
@@ -631,7 +674,8 @@ proc extractCustomEmoji(content: string): seq[string] =
     else:
       i.inc
 
-proc sendNostrPost(content: string, mentions: seq[string] = @[]) {.async.} =
+proc sendNostrPost(content: string, mentions: seq[string] = @[],
+                   replyTo: string = "", replyAuthor: string = "") {.async.} =
   if savedSecKeyHex == "": return
 
   let seckeyRes = SkSecretKey.fromHex(savedSecKeyHex)
@@ -652,6 +696,11 @@ proc sendNostrPost(content: string, mentions: seq[string] = @[]) {.async.} =
   for emojiName in extractCustomEmoji(content):
     let url = if customEmojiUrls.hasKey(emojiName): customEmojiUrls[emojiName] else: ""
     tags.add(%* ["emoji", emojiName, url])
+  # Reply tags (NIP-10): ["e", eventId, relayUrl, "reply"] + ["p", authorPubkey].
+  if replyTo != "":
+    tags.add(%* ["e", replyTo, "", "reply"])
+  if replyAuthor != "":
+    tags.add(%* ["p", replyAuthor])
   
   let serializeArray = %*[
     0, pubkeyHex, createdAt, 1, tags, content
@@ -692,7 +741,8 @@ proc sendNostrPost(content: string, mentions: seq[string] = @[]) {.async.} =
   # Optimistically show our own post in the timeline (tagged via Nosterm).
   # It will be de-duplicated when the relay echoes it back.
   let localEvent = NostrEvent(id: eventId, pubkey: pubkeyHex, content: content,
-                              createdAt: createdAt, client: "Nosterm")
+                              createdAt: createdAt, client: "Nosterm",
+                              replyToId: replyTo)
   insertEvent(localEvent)
 
   try:
@@ -811,6 +861,8 @@ proc handleInputRune(ru: Rune) =
     inputBuffer = ""
     mentionMap.clear()
     mentionAnchor = -1
+    replyToId = ""
+    replyToAuthor = ""
     hideTermCursor()
     needsRedraw = true
   elif ru == Rune(int('\n')) or ru == Rune(int('\r')):
@@ -824,10 +876,12 @@ proc handleInputRune(ru: Rune) =
         if tok in content:
           content = content.replace(tok, "nostr:" & encodeBech32("npub", hexToBytes(pk)))
           mentionPks.add(pk)
-      asyncCheck sendNostrPost(content, mentionPks)
+      asyncCheck sendNostrPost(content, mentionPks, replyToId, replyToAuthor)
       inputBuffer = ""
       mentionMap.clear()
       mentionAnchor = -1
+      replyToId = ""
+      replyToAuthor = ""
     appMode = AppMode.ModeNormal
     hideTermCursor()
     needsRedraw = true
@@ -1015,11 +1069,14 @@ proc processPacket(packet: string) =
           let createdAt = event["created_at"].getInt()
           let eventId = event["id"].getStr()
           var clientName = ""
+          var replyTo = ""
           if event.hasKey("tags") and event["tags"].kind == JArray:
             for t in event["tags"]:
               if t.kind == JArray and t.len >= 2:
                 if t[0].getStr() == "client":
                   clientName = t[1].getStr()
+                elif t[0].getStr() == "e" and replyTo == "":
+                  replyTo = t[1].getStr()
                 # Cache custom emoji URLs from NIP-30 tags.
                 elif t[0].getStr() == "emoji" and t.len >= 3:
                   let emName = t[1].getStr()
@@ -1027,7 +1084,8 @@ proc processPacket(packet: string) =
                   if emName != "" and emUrl != "" and not customEmojiUrls.hasKey(emName):
                     customEmojiUrls[emName] = emUrl
           let newEvent = NostrEvent(id: eventId, pubkey: pubkey, content: content,
-                                   createdAt: createdAt, client: clientName)
+                                    createdAt: createdAt, client: clientName,
+                                    replyToId: replyTo)
           insertEvent(newEvent)
 
         elif kind == 10002:
@@ -1173,7 +1231,7 @@ proc moveSelection(delta: int) =
 # newest (timeline is sorted oldest-first, so index high = newest).
 proc currentSelectedEvent(): NostrEvent =
   if timeline.len == 0:
-    return NostrEvent(id: "", pubkey: "", content: "", createdAt: 0, client: "")
+    return NostrEvent(id: "", pubkey: "", content: "", createdAt: 0, client: "", replyToId: "")
   if selectedEventId != "":
     for ev in timeline:
       if ev.id == selectedEventId: return ev
@@ -1356,6 +1414,8 @@ proc main() {.async.} =
       case key
       of Key.Q, Key.Escape: exitProc()
       of Key.I:
+        replyToId = ""
+        replyToAuthor = ""
         appMode = AppMode.ModeInput
         needsRedraw = true
         showTermCursor()
@@ -1386,6 +1446,18 @@ proc main() {.async.} =
         if currentSelectedEvent().id != "":
           reactionBuffer = ""
           appMode = AppMode.ModeReaction
+          needsRedraw = true
+          showTermCursor()
+      of Key.C:
+        # Reply to the focused post.
+        let sel = currentSelectedEvent()
+        if sel.id != "":
+          replyToId = sel.id
+          replyToAuthor = sel.pubkey
+          inputBuffer = ""
+          mentionMap.clear()
+          mentionAnchor = -1
+          appMode = AppMode.ModeInput
           needsRedraw = true
           showTermCursor()
       of Key.R:
@@ -1691,76 +1763,72 @@ proc main() {.async.} =
     # --------------------------------------------------
     if needsRedraw:
       tb.clear()
-      # Draw borders first (they persist)
-      tb.drawRect(0, 0, cols - 1, rows - 1)
-      tb.write(2, 0, "[ Nosterm ]", illwill.fgYellow)
+      # Rounded outer frame (OpenTUI style)
+      drawRoundedBox(tb, 0, 0, cols - 1, rows - 1)
 
       if appMode == AppMode.ModeKeyInput:
-        tb.write(4, 3, "Welcome to Nosterm!", illwill.fgYellow)
-        tb.write(4, 5, "Please enter your Nostr secret key (nsec1...):", illwill.fgWhite)
-        tb.drawHorizLine(4, cols - 5, 7)
-        
+        drawRoundedBox(tb, 2, 2, cols - 3, rows - 3, "Welcome")
+        tb.write(4, 4, "Please enter your Nostr secret key (nsec1...):", illwill.fgWhite)
+        tb.drawHorizLine(4, cols - 5, 6)
         var maskedKey = ""
         for idx, c in keyInputBuffer:
           if idx < 9: maskedKey.add(c)
           else: maskedKey.add('*')
-          
-        tb.write(4, 6, "> " & maskedKey, illwill.fgCyan)
-        tb.write(4, rows - 3, "Press [Enter] to Save & Start | [Esc] to Cancel", illwill.fgWhite)
+        tb.write(4, 5, "> " & maskedKey, illwill.fgCyan)
+        tb.write(4, rows - 4, "Press [Enter] to Save & Start | [Esc] to Cancel", illwill.fgWhite)
 
       elif appMode == AppMode.ModeSettings:
-        tb.write(2, 1, "Settings", illwill.fgYellow)
-        tb.write(2, 3, "Account key (nsec):", illwill.fgWhite)
+        drawRoundedBox(tb, 1, 0, cols - 2, rows - 1, "Settings")
+        tb.write(3, 2, "Account key (nsec):", illwill.fgWhite)
         let keyMask = if savedNsec != "": "nsec1" & "*".repeat(max(1, savedNsec.len - 8)) else: "(not set)"
-        tb.write(4, 4, keyMask, illwill.fgCyan)
-        tb.write(2, 6, "Japanese-only filter:", illwill.fgWhite)
-        tb.write(4, 7, if japaneseOnly: "ON" else: "OFF", illwill.fgCyan)
-        tb.write(2, 9, "Relays configured:", illwill.fgWhite)
+        tb.write(5, 3, keyMask, illwill.fgCyan)
+        tb.write(3, 5, "Japanese-only filter:", illwill.fgWhite)
+        tb.write(5, 6, if japaneseOnly: "ON" else: "OFF", illwill.fgCyan)
+        tb.write(3, 8, "Relays configured:", illwill.fgWhite)
         let profName = if activeProfile < relayProfiles.len: relayProfiles[activeProfile].name else: "Default"
-        tb.write(4, 10, $relayConfigs.len & " (profile: " & profName & ")", illwill.fgCyan)
-        tb.drawHorizLine(2, cols - 3, 12)
-        tb.write(2, 13, "A  Manage accounts", illwill.fgWhite)
-        tb.write(2, 14, "R  Manage relays (add / remove / read-write)", illwill.fgWhite)
-        tb.write(2, 15, "K  Change account key (nsec)", illwill.fgWhite)
-        tb.write(2, 16, "J  Toggle Japanese-only filter", illwill.fgWhite)
-        tb.write(2, rows - 3, fitToWidth("A:Accounts  R:Relays  K:Key  J:Filter  Esc:Back to timeline", cols - 4), illwill.fgWhite)
+        tb.write(5, 9, $relayConfigs.len & " (profile: " & profName & ")", illwill.fgCyan)
+        tb.drawHorizLine(3, cols - 4, 11)
+        tb.write(3, 12, "A  Manage accounts", illwill.fgWhite)
+        tb.write(3, 13, "R  Manage relays (add / remove / read-write)", illwill.fgWhite)
+        tb.write(3, 14, "K  Change account key (nsec)", illwill.fgWhite)
+        tb.write(3, 15, "J  Toggle Japanese-only filter", illwill.fgWhite)
+        tb.write(2, rows - 2, fitToWidth("A:Accounts  R:Relays  K:Key  J:Filter  Esc:Back to timeline", cols - 4), illwill.fgWhite)
 
       elif appMode == AppMode.ModeRelay:
         let profName = if activeProfile < relayProfiles.len: relayProfiles[activeProfile].name else: "Default"
-        tb.write(2, 1, "Relays [" & profName & "]", illwill.fgYellow)
-        tb.write(2, 2, fmt" {relayConfigs.len} configured", illwill.fgWhite)
+        drawRoundedBox(tb, 1, 0, cols - 2, rows - 1, "Relays [" & profName & "]")
+        tb.write(3, 2, fmt"{relayConfigs.len} configured", illwill.fgWhite)
         let listTop = 4
         for idx in 0 ..< relayConfigs.len:
           let y = listTop + idx
           if y >= rows - 3: break
           let rc = relayConfigs[idx]
           var connected = false
-          for c in relayConns:
-            if c.gen == relayGen and c.url == rc.url:
-              connected = true
-              break
+          for cn in relayConns:
+            if cn.gen == relayGen and cn.url == rc.url:
+              connected = true; break
           let sel = (idx == relaySel)
           let mark = if sel: "▶ " else: "  "
           let rchk = if rc.read: "[x]" else: "[ ]"
           let wchk = if rc.write: "[x]" else: "[ ]"
           let status = if connected: "●" else: "○"
           var lineStr = mark & status & " " & rchk & "R " & wchk & "W  " & rc.url
-          lineStr = fitToWidth(lineStr, cols - 4)
-          if sel: writeLine(tb, 2, y, lineStr, illwill.fgYellow)
-          else: writeLine(tb, 2, y, lineStr, illwill.fgWhite)
-        tb.write(2, rows - 3, fitToWidth("↑/↓ select  r:Read  w:Write  a:Add  d:Delete  p:Profiles  Esc:Back", cols - 4), illwill.fgWhite)
+          lineStr = fitToWidth(lineStr, cols - 6)
+          if sel: writeLine(tb, 3, y, lineStr, illwill.fgYellow, maxX = cols - 3)
+          else: writeLine(tb, 3, y, lineStr, illwill.fgWhite, maxX = cols - 3)
+        tb.write(2, rows - 2, fitToWidth("↑/↓ select  r:Read  w:Write  a:Add  d:Delete  p:Profiles  Esc:Back", cols - 4), illwill.fgWhite)
 
       elif appMode == AppMode.ModeRelayAdd:
-        tb.write(2, 1, "Add Relay", illwill.fgYellow)
-        tb.write(2, 3, "URL (wss://... or ws://...):", illwill.fgWhite)
-        tb.drawHorizLine(2, cols - 3, 5)
-        tb.write(4, 4, "> " & relayAddBuffer, illwill.fgCyan)
-        tb.write(2, rows - 3, "Press [Enter] to Add | [Esc] to Cancel", illwill.fgWhite)
+        drawRoundedBox(tb, 1, 0, cols - 2, rows - 1, "Add Relay")
+        tb.write(3, 2, "URL (wss://... or ws://...):", illwill.fgWhite)
+        tb.drawHorizLine(3, cols - 4, 4)
+        tb.write(5, 3, "> " & relayAddBuffer, illwill.fgCyan)
+        tb.write(2, rows - 2, "Press [Enter] to Add | [Esc] to Cancel", illwill.fgWhite)
 
       elif appMode == AppMode.ModeRelayPick:
-        tb.write(2, 1, "Relays from your account (kind 10002)", illwill.fgYellow)
+        drawRoundedBox(tb, 1, 0, cols - 2, rows - 1, "Account Relays")
         if accountRelays.len == 0:
-          tb.write(2, 3, "Fetching... (or none found). Press [Esc] to go back.", illwill.fgWhite)
+          tb.write(3, 2, "Fetching... (or none found). Press [Esc] to go back.", illwill.fgWhite)
         else:
           for idx in 0 ..< accountRelays.len:
             let y = 3 + idx
@@ -1774,14 +1842,13 @@ proc main() {.async.} =
             for rc in relayConfigs:
               if rc.url == a.url: added = true
             var lineStr = mark & rchk & "R " & wchk & "W  " & a.url & (if added: "  (already added)" else: "")
-            lineStr = fitToWidth(lineStr, cols - 4)
-            if sel: writeLine(tb, 2, y, lineStr, illwill.fgYellow)
-            else: writeLine(tb, 2, y, lineStr, illwill.fgWhite)
-          tb.write(2, rows - 3, fitToWidth("↑/↓ select  Enter add  Esc back", cols - 4), illwill.fgWhite)
+            lineStr = fitToWidth(lineStr, cols - 6)
+            if sel: writeLine(tb, 3, y, lineStr, illwill.fgYellow, maxX = cols - 3)
+            else: writeLine(tb, 3, y, lineStr, illwill.fgWhite, maxX = cols - 3)
 
       elif appMode == AppMode.ModeRelayProfile:
-        tb.write(2, 1, "Relay Profiles", illwill.fgYellow)
-        tb.write(2, 2, fmt" {relayProfiles.len} profiles", illwill.fgWhite)
+        drawRoundedBox(tb, 1, 0, cols - 2, rows - 1, "Relay Profiles")
+        tb.write(3, 2, fmt"{relayProfiles.len} profiles", illwill.fgWhite)
         let listTop = 4
         for idx in 0 ..< relayProfiles.len:
           let y = listTop + idx
@@ -1792,21 +1859,21 @@ proc main() {.async.} =
           let mark = if sel: "▶ " else: "  "
           let activeMark = if active: "● " else: "○ "
           var lineStr = mark & activeMark & rp.name & "  (" & $rp.relays.len & " relays)"
-          lineStr = fitToWidth(lineStr, cols - 4)
-          if sel: writeLine(tb, 2, y, lineStr, illwill.fgYellow)
-          else: writeLine(tb, 2, y, lineStr, illwill.fgWhite)
-        tb.write(2, rows - 3, fitToWidth("↑/↓ select  Enter activate  n:New  d:Delete  Esc:Back", cols - 4), illwill.fgWhite)
+          lineStr = fitToWidth(lineStr, cols - 6)
+          if sel: writeLine(tb, 3, y, lineStr, illwill.fgYellow, maxX = cols - 3)
+          else: writeLine(tb, 3, y, lineStr, illwill.fgWhite, maxX = cols - 3)
+        tb.write(2, rows - 2, fitToWidth("↑/↓ select  Enter activate  n:New  d:Delete  Esc:Back", cols - 4), illwill.fgWhite)
 
       elif appMode == AppMode.ModeRelayProfileAdd:
-        tb.write(2, 1, "New Relay Profile", illwill.fgYellow)
-        tb.write(2, 3, "Profile name:", illwill.fgWhite)
-        tb.drawHorizLine(2, cols - 3, 5)
-        tb.write(4, 4, "> " & profileNameBuffer, illwill.fgCyan)
-        tb.write(2, rows - 3, "Press [Enter] to Create | [Esc] to Cancel", illwill.fgWhite)
+        drawRoundedBox(tb, 1, 0, cols - 2, rows - 1, "New Relay Profile")
+        tb.write(3, 2, "Profile name:", illwill.fgWhite)
+        tb.drawHorizLine(3, cols - 4, 4)
+        tb.write(5, 3, "> " & profileNameBuffer, illwill.fgCyan)
+        tb.write(2, rows - 2, "Press [Enter] to Create | [Esc] to Cancel", illwill.fgWhite)
 
       elif appMode == AppMode.ModeAccount:
-        tb.write(2, 1, "Accounts", illwill.fgYellow)
-        tb.write(2, 2, fmt" {accounts.len} configured", illwill.fgWhite)
+        drawRoundedBox(tb, 1, 0, cols - 2, rows - 1, "Accounts")
+        tb.write(3, 2, fmt"{accounts.len} configured", illwill.fgWhite)
         let listTop = 4
         for idx in 0 ..< accounts.len:
           let y = listTop + idx
@@ -1818,50 +1885,66 @@ proc main() {.async.} =
           let activeMark = if active: "● " else: "○ "
           let keyStatus = if ac.nsec != "": "key set" else: "no key"
           var lineStr = mark & activeMark & ac.name & "  (" & keyStatus & ")"
-          lineStr = fitToWidth(lineStr, cols - 4)
-          if sel: writeLine(tb, 2, y, lineStr, illwill.fgYellow)
-          else: writeLine(tb, 2, y, lineStr, illwill.fgWhite)
-        tb.write(2, rows - 3, fitToWidth("↑/↓ select  Enter switch  n:New  s:Set key  d:Delete  Esc:Back", cols - 4), illwill.fgWhite)
+          lineStr = fitToWidth(lineStr, cols - 6)
+          if sel: writeLine(tb, 3, y, lineStr, illwill.fgYellow, maxX = cols - 3)
+          else: writeLine(tb, 3, y, lineStr, illwill.fgWhite, maxX = cols - 3)
+        tb.write(2, rows - 2, fitToWidth("↑/↓ select  Enter switch  n:New  s:Set key  d:Delete  Esc:Back", cols - 4), illwill.fgWhite)
 
       elif appMode == AppMode.ModeAccountAdd:
-        tb.write(2, 1, "New Account", illwill.fgYellow)
-        tb.write(2, 3, "Account name:", illwill.fgWhite)
-        tb.drawHorizLine(2, cols - 3, 5)
-        tb.write(4, 4, "> " & accountNameBuffer, illwill.fgCyan)
-        tb.write(2, rows - 3, "Press [Enter] to Create | [Esc] to Cancel", illwill.fgWhite)
+        drawRoundedBox(tb, 1, 0, cols - 2, rows - 1, "New Account")
+        tb.write(3, 2, "Account name:", illwill.fgWhite)
+        tb.drawHorizLine(3, cols - 4, 4)
+        tb.write(5, 3, "> " & accountNameBuffer, illwill.fgCyan)
+        tb.write(2, rows - 2, "Press [Enter] to Create | [Esc] to Cancel", illwill.fgWhite)
 
       else:
-        let statusText = if scrollOffset == 0: "[ LIVE - Tracking Latest ]" else: fmt"[ Scroll: {scrollOffset} (Press 'L' to Live) ]"
+        # ── Main timeline view (OpenTUI-style panels) ──
+        # Header panel
+        let statusText = if scrollOffset == 0: "● LIVE" else: "○ Scroll " & $scrollOffset
         let statusColor = if scrollOffset == 0: illwill.fgGreen else: illwill.fgMagenta
-        tb.write(cols - 2 - statusText.len, 0, statusText, statusColor)
-        
-        tb.drawHorizLine(1, cols - 2, rows - 4)
-        
-        if appMode == AppMode.ModeNormal:
-          tb.write(2, rows - 3, fitToWidth("i:Post S:Settings R:Relays F:JP ←/→:Select e:React K/J:Scroll L:Live Ctrl+L:Reload Q:Quit", cols - 4), illwill.fgWhite)
-        elif appMode == AppMode.ModeMention:
-          tb.write(2, rows - 3, fitToWidth("↑/↓ select  Enter choose  Esc cancel", cols - 4), illwill.fgYellow)
-        elif appMode == AppMode.ModeReaction:
-          tb.write(2, rows - 3, fitToWidth("type emoji + Enter to react  Esc cancel", cols - 4), illwill.fgYellow)
-          let prompt = "react> "
-          writeLine(tb, 2, rows - 2, prompt, illwill.fgCyan)
-          writeLine(tb, 2 + prompt.len, rows - 2, reactionBuffer, illwill.fgWhite)
-        else:
-          tb.write(2, rows - 3, fitToWidth("TYPE MESSAGE + ENTER TO POST (ESC CANCEL)", cols - 4), illwill.fgYellow)
+        drawRoundedBox(tb, 1, 0, cols - 2, 2, "Nosterm")
+        tb.write(cols - 2 - statusText.len, 1, statusText, statusColor)
 
+        # Input panel (bottom 3 rows)
+        let inputTop = rows - 4
+        drawRoundedBox(tb, 1, inputTop, cols - 2, rows - 2, "Post")
+        if appMode == AppMode.ModeNormal:
+          tb.write(3, inputTop + 1, fitToWidth("i:Post c:Reply S:Settings R:Relays F:JP ←/→:Select e:React K/J:Scroll L:Live Q:Quit", cols - 6), illwill.fgWhite)
+        elif appMode == AppMode.ModeMention:
+          tb.write(3, inputTop + 1, fitToWidth("↑/↓ select  Enter choose  Esc cancel", cols - 6), illwill.fgYellow)
+        elif appMode == AppMode.ModeReaction:
+          tb.write(3, inputTop + 1, fitToWidth("type emoji + Enter to react  Esc cancel", cols - 6), illwill.fgYellow)
+          let prompt = "react> "
+          writeLine(tb, 3, inputTop + 2, prompt, illwill.fgCyan, maxX = cols - 3)
+          writeLine(tb, 3 + prompt.len, inputTop + 2, reactionBuffer, illwill.fgWhite, maxX = cols - 3)
+        else:
+          if replyToId != "":
+            let replyEv = block:
+              var found = NostrEvent(id: "", pubkey: "", content: "", createdAt: 0, client: "", replyToId: "")
+              for ev in timeline:
+                if ev.id == replyToId: found = ev; break
+              found
+            let replyName = if profileCache.hasKey(replyToAuthor.toLowerAscii()):
+                              profileCache[replyToAuthor.toLowerAscii()]
+                            else: replyToAuthor[0..7]
+            let replyPreview = fitToWidth(replyEv.content, cols - 14)
+            tb.write(3, inputTop + 1, "↩ @" & replyName & ": " & replyPreview, illwill.fgMagenta)
+          else:
+            tb.write(3, inputTop + 1, fitToWidth("TYPE MESSAGE + ENTER TO POST (ESC CANCEL)", cols - 6), illwill.fgYellow)
           let prompt = "> "
-          writeLine(tb, 2, rows - 2, prompt, illwill.fgCyan)
-          writeLine(tb, 2 + prompt.len, rows - 2, displayContent(inputBuffer), illwill.fgWhite)
+          writeLine(tb, 3, inputTop + 2, prompt, illwill.fgCyan, maxX = cols - 3)
+          writeLine(tb, 3 + prompt.len, inputTop + 2, displayContent(inputBuffer), illwill.fgWhite, maxX = cols - 3)
+
+        # Timeline panel (between header and input)
+        let tlTop = 3
+        let tlBottom = inputTop - 1
+        drawRoundedBox(tb, 1, tlTop, cols - 2, tlBottom)
 
         # Build visible items list (respecting japaneseOnly filter)
         var visibleItems: seq[int] = @[]
         for i in 0 .. timeline.high:
           if not (japaneseOnly and not containsJapanese(timeline[i].content)):
             visibleItems.add(i)
-        
-        let timelineBottomY = rows - 5
-        let timelineTopY = 1
-        var currentY = timelineBottomY
 
         let visibleCount = visibleItems.len
         if scrollOffset > visibleCount - 1 and visibleCount > 0:
@@ -1870,87 +1953,102 @@ proc main() {.async.} =
 
         if visibleCount > 0:
           let startIdx = visibleCount - 1 - scrollOffset
-          let maxDisplayWidth = cols - 2
-          let borderChar = TerminalChar(ch: Rune(0x2502), fg: illwill.fgWhite, bg: illwill.bgNone, style: {})
+          var currentY = tlBottom - 1  # start from bottom of timeline panel
 
           for visibleIdx in countdown(startIdx, 0):
-            if currentY < timelineTopY: break
+            if currentY <= tlTop + 1: break
 
             let i = visibleItems[visibleIdx]
             let ev = timeline[i]
-
             let displayName = if profileCache.hasKey(ev.pubkey.toLowerAscii()):
                                 profileCache[ev.pubkey.toLowerAscii()]
-                              else:
-                                ev.pubkey[0..7]
-
+                              else: ev.pubkey[0..7]
             let isSelected = (ev.id == selectedEventId) or
                              (selectedEventId == "" and i == timeline.high)
             let selColor = if isSelected: illwill.fgYellow else: illwill.fgCyan
-
-            let namePart = fmt"[{displayName}]"
-            let viaLabel = if ev.client != "": "· via " & ev.client & ": " else: ""
+            let viaLabel = if ev.client != "": "· " & ev.client & " " else: ""
             let viaColor = if ev.client.toLowerAscii() == "nosterm": illwill.fgGreen
                            else: illwill.fgWhite
 
-            let viaPrefixWidth = displayWidth(viaLabel)
-            let maxContentWidth = max(1, cols - 2 - viaPrefixWidth)
-            let wrappedLines = wrapText(displayContent(ev.content), maxContentWidth)
-            let nLines = 1 + wrappedLines.len
+            # ── Reply quote block (NIP-10) ──
+            var quoteLines: seq[string] = @[]
+            if ev.replyToId != "":
+              var replyEv = NostrEvent(id: "", pubkey: "", content: "", createdAt: 0, client: "", replyToId: "")
+              for tev in timeline:
+                if tev.id == ev.replyToId: replyEv = tev; break
+              let replyName = if profileCache.hasKey(replyEv.pubkey.toLowerAscii()):
+                                profileCache[replyEv.pubkey.toLowerAscii()]
+                              elif replyEv.pubkey != "": replyEv.pubkey[0..7]
+                              else: "unknown"
+              let quoteMaxW = max(1, cols - 10)
+              let qWrapped = wrapText(replyEv.content, quoteMaxW)
+              quoteLines.add(" ↳ @" & replyName)
+              for ql in qWrapped:
+                quoteLines.add("   " & ql)
 
-            # Display name on its own line (top of the post block).
-            let nameY = currentY - nLines + 1
-            if nameY >= timelineTopY:
-              writeLine(tb, 1, nameY, namePart, selColor)
-              tb[cols - 1, nameY] = borderChar
+            let contentMaxW = max(1, cols - 6)
+            let wrappedContent = wrapText(displayContent(ev.content), contentMaxW)
+            let nameLineH = 1
+            let quoteH = quoteLines.len
+            let contentH = wrappedContent.len
+            let totalH = nameLineH + quoteH + contentH
 
-            # Content lines below; the first one carries the "via" badge.
-            for li in 0 .. wrappedLines.high:
-              let y = currentY - nLines + 2 + li
-              if y < timelineTopY: break
-              let contentPart = wrappedLines[li]
-              let usedWidth = viaPrefixWidth + displayWidth(contentPart)
-              let padWidth = max(0, maxDisplayWidth - usedWidth)
-              let padStr = " ".repeat(padWidth)
-              if li == 0 and viaLabel != "":
-                writeLine(tb, 1, y, viaLabel, viaColor)
-              writeLine(tb, 1 + viaPrefixWidth, y, contentPart & padStr,
-                        if isSelected: illwill.fgYellow else: illwill.fgWhite)
-              tb[cols - 1, y] = borderChar
+            # ── Draw card bottom border (drawn first: highest Y) ──
+            if currentY > tlTop and currentY <= tlBottom - 1:
+              let cardColor = if isSelected: illwill.fgYellow else: illwill.fgBlue
+              tb[2, currentY] = TerminalChar(ch: Rune(0x2570), fg: cardColor, bg: bgNone, style: {})
+              for x in 3 ..< cols - 3:
+                tb[x, currentY] = TerminalChar(ch: Rune(0x2500), fg: cardColor, bg: bgNone, style: {})
+              tb[cols - 3, currentY] = TerminalChar(ch: Rune(0x256F), fg: cardColor, bg: bgNone, style: {})
+              currentY.dec
 
-            currentY = currentY - nLines
+            # ── Name line: "[name] · client ──
+            if currentY > tlTop:
+              var nameStr = " " & displayName
+              if viaLabel != "": nameStr &= "  " & viaLabel
+              nameStr = fitToWidth(nameStr, contentMaxW)
+              writeLine(tb, 3, currentY, nameStr, selColor, maxX = cols - 4)
+              currentY.dec
 
-            # Reaction summary line (NIP-25), if any for this post.
-            if reactions.hasKey(ev.id):
+            # ── Quote block (if reply) ──
+            for qli in countdown(quoteLines.high, 0):
+              if currentY <= tlTop: break
+              let qLine = fitToWidth(quoteLines[qli], contentMaxW)
+              writeLine(tb, 3, currentY, qLine, illwill.fgWhite, maxX = cols - 4)
+              currentY.dec
+
+            # ── Content lines ──
+            for cli in countdown(wrappedContent.high, 0):
+              if currentY <= tlTop: break
+              let cLine = fitToWidth(wrappedContent[cli], contentMaxW)
+              writeLine(tb, 3, currentY, cLine, if isSelected: illwill.fgWhite else: illwill.fgWhite, maxX = cols - 4)
+              currentY.dec
+
+            # ── Reaction summary ──
+            if reactions.hasKey(ev.id) and currentY > tlTop:
               let rs = reactions[ev.id]
               var counts = initTable[string, int]()
               for r in rs: counts[r.emoji] = counts.getOrDefault(r.emoji, 0) + 1
               var parts: seq[string] = @[]
               for k, v in pairs(counts): parts.add(k & " " & $v)
-              let reactLine = parts.join("  ")
-              if reactLine != "" and currentY >= timelineTopY:
-                let rused = displayWidth(reactLine)
-                let rpad = max(0, maxDisplayWidth - rused)
-                writeLine(tb, 1, currentY, reactLine & " ".repeat(rpad),
-                          if isSelected: illwill.fgYellow else: illwill.fgWhite)
-                tb[cols - 1, currentY] = borderChar
-                currentY -= 1
+              let reactLine = fitToWidth(parts.join("  "), contentMaxW)
+              if reactLine != "":
+                writeLine(tb, 3, currentY, reactLine, illwill.fgWhite, maxX = cols - 4)
+                currentY.dec
 
-            # Separator line between posts (panel divider)
-            if currentY >= timelineTopY:
-              tb.drawHorizLine(1, cols - 2, currentY)
-              tb[cols - 1, currentY] = borderChar
-              currentY -= 1
+            # ── Card top border (drawn second: lowest Y) ──
+            if currentY > tlTop:
+              let sepColor = if isSelected: illwill.fgYellow else: illwill.fgBlue
+              tb[2, currentY] = TerminalChar(ch: Rune(0x256D), fg: sepColor, bg: bgNone, style: {})
+              for x in 3 ..< cols - 3:
+                tb[x, currentY] = TerminalChar(ch: Rune(0x2500), fg: sepColor, bg: bgNone, style: {})
+              tb[cols - 3, currentY] = TerminalChar(ch: Rune(0x256E), fg: sepColor, bg: bgNone, style: {})
+              currentY.dec
 
       if appMode == AppMode.ModeMention:
-        # Overlay a mention picker above the input line.
-        let panelTop = max(2, rows - 14)
-        let panelBottom = rows - 4
-        tb.drawRect(1, panelTop, cols - 2, panelBottom)
-        # Erase the timeline behind the panel so posts don't bleed through.
-        for py in panelTop + 1 .. panelBottom - 1:
-          tb.write(2, py, " ".repeat(max(1, cols - 4)), illwill.fgWhite)
-        tb.write(3, panelTop, " Mention  ↑/↓ select  Enter choose  Esc cancel ", illwill.fgYellow)
+        let panelTop = max(4, rows - 14)
+        let panelBottom = rows - 5
+        drawRoundedBox(tb, 2, panelTop, cols - 3, panelBottom, "Mention")
         if mentionList.len > 0:
           let listTop = panelTop + 2
           let maxShow = max(1, panelBottom - listTop - 1)
@@ -1965,40 +2063,39 @@ proc main() {.async.} =
             let nm = mentionList[li].name
             let pkShort = mentionList[li].pubkey[0 .. 7]
             let lineStr = " " & (if sel: "▶ " else: "  ") & "@" & nm & "  (" & pkShort & ")"
-            if sel:
-              writeLine(tb, 3, y, lineStr, illwill.fgYellow)
-            else:
-              writeLine(tb, 3, y, lineStr, illwill.fgWhite)
-          # redraw the input line on top of the panel's bottom edge
+            if sel: writeLine(tb, 4, y, lineStr, illwill.fgYellow, maxX = cols - 4)
+            else: writeLine(tb, 4, y, lineStr, illwill.fgWhite, maxX = cols - 4)
           let prompt = "> "
-          writeLine(tb, 2, rows - 2, prompt, illwill.fgCyan)
-          writeLine(tb, 2 + prompt.len, rows - 2, displayContent(inputBuffer), illwill.fgWhite)
+          let inputTop = rows - 4
+          writeLine(tb, 3, inputTop + 2, prompt, illwill.fgCyan, maxX = cols - 3)
+          writeLine(tb, 3 + prompt.len, inputTop + 2, displayContent(inputBuffer), illwill.fgWhite, maxX = cols - 3)
         else:
-          tb.write(3, panelTop + 2, " (no profiles loaded yet)", illwill.fgWhite)
+          tb.write(4, panelTop + 2, " (no profiles loaded yet)", illwill.fgWhite)
 
       renderToTerminal(tb)
       needsRedraw = false
 
     # Cursor: reposition every frame so it never drifts to the bottom-right,
     # and only show it while actually typing text.
+    let inputCursorY = rows - 2  # input line is at inputTop+2 = rows-4+2 = rows-2
     if appMode == AppMode.ModeInput or appMode == AppMode.ModeMention:
       showTermCursor()
-      setTermCursor(2 + 2 + displayWidth(displayContent(inputBuffer)), rows - 2)
+      setTermCursor(3 + 2 + displayWidth(displayContent(inputBuffer)), inputCursorY)
     elif appMode == AppMode.ModeReaction:
       showTermCursor()
-      setTermCursor(2 + 7 + displayWidth(reactionBuffer), rows - 2)
+      setTermCursor(3 + 7 + displayWidth(reactionBuffer), inputCursorY)
     elif appMode == AppMode.ModeKeyInput:
       showTermCursor()
-      setTermCursor(4 + 2 + keyInputBuffer.len, 6)
+      setTermCursor(5 + 2 + keyInputBuffer.len, 5)
     elif appMode == AppMode.ModeRelayAdd:
       showTermCursor()
-      setTermCursor(4 + 2 + relayAddBuffer.len, 4)
+      setTermCursor(5 + 2 + relayAddBuffer.len, 3)
     elif appMode == AppMode.ModeRelayProfileAdd:
       showTermCursor()
-      setTermCursor(4 + 2 + profileNameBuffer.len, 4)
+      setTermCursor(5 + 2 + profileNameBuffer.len, 3)
     elif appMode == AppMode.ModeAccountAdd:
       showTermCursor()
-      setTermCursor(4 + 2 + accountNameBuffer.len, 4)
+      setTermCursor(5 + 2 + accountNameBuffer.len, 3)
     else:
       hideTermCursor()
 
